@@ -1,15 +1,18 @@
 bl_info = {
     "name": "Miniature Voxeler",
     "author": "OpenAI",
-    "version": (2, 0, 2),
+    "version": (2, 0, 9),
     "blender": (5, 0, 1),
     "location": "3D View > Sidebar > Miniature Voxeler",
-    "description": "Block remesh, transfer texture, create Lego-color face materials, and generate Lego skin or north-south skin meshes for miniature voxel workflows",
+    "description": "Block remesh, transfer texture, create Lego-color face materials, and generate Lego skin meshes for miniature voxel workflows",
     "category": "Object",
 }
 
 import bpy
 import bmesh
+import gpu
+from gpu_extras.batch import batch_for_shader
+from math import cos, hypot, pi, sin
 from bpy_extras import view3d_utils
 from mathutils import Vector
 from bpy.types import Operator, Panel, PropertyGroup
@@ -23,7 +26,62 @@ from bpy.props import (
     EnumProperty,
 )
 
-ADDON_VERSION_TEXT = "v.2.0.2"
+ADDON_VERSION_TEXT = "v.2.0.9"
+
+
+def srgb_channel_to_linear(value):
+    value = value / 255.0
+    if value <= 0.04045:
+        return value / 12.92
+    return ((value + 0.055) / 1.055) ** 2.4
+
+
+def hex_to_linear_rgb(hex_color):
+    hex_color = hex_color.lstrip("#")
+    return (
+        srgb_channel_to_linear(int(hex_color[0:2], 16)),
+        srgb_channel_to_linear(int(hex_color[2:4], 16)),
+        srgb_channel_to_linear(int(hex_color[4:6], 16)),
+    )
+
+FIXED_LEGO_PALETTE = [
+    ("Deep Night", hex_to_linear_rgb("#0f0d1c")),
+    ("Muted Periwinkle", hex_to_linear_rgb("#7b86a9")),
+    ("Pale Ice Blue", hex_to_linear_rgb("#bbd1d3")),
+    ("White", hex_to_linear_rgb("#ffffff")),
+    ("Electric Cyan", hex_to_linear_rgb("#62e0f9")),
+    ("Soft Cobalt", hex_to_linear_rgb("#5575c7")),
+    ("Deep Violet", hex_to_linear_rgb("#4a3571")),
+    ("Lavender Blue", hex_to_linear_rgb("#8d5fb3")),
+    ("Light Cornflower", hex_to_linear_rgb("#9cbcff")),
+    ("Royal Purple", hex_to_linear_rgb("#723a84")),
+    ("Hot Magenta", hex_to_linear_rgb("#e955ae")),
+    ("Peach", hex_to_linear_rgb("#ffc7a2")),
+    ("Coral Red", hex_to_linear_rgb("#e86262")),
+    ("Wine Rose", hex_to_linear_rgb("#943c59")),
+    ("Warm Orange", hex_to_linear_rgb("#e88a4c")),
+    ("Soft Yellow", hex_to_linear_rgb("#ffed6b")),
+    ("Fresh Green", hex_to_linear_rgb("#67d758")),
+    ("Deep Teal", hex_to_linear_rgb("#3b786c")),
+    ("Aqua Teal", hex_to_linear_rgb("#4db8af")),
+    ("Mint Glow", hex_to_linear_rgb("#a1ffce")),
+]
+
+FIXED_LEGO_PALETTE_ITEMS = [
+    (str(index), name, f"Use {name} for this Lego color slot")
+    for index, (name, color) in enumerate(FIXED_LEGO_PALETTE)
+]
+
+
+def get_fixed_palette_color(slot_palette_index):
+    return FIXED_LEGO_PALETTE[int(slot_palette_index)][1]
+
+
+def find_nearest_fixed_palette_index(color):
+    return min(
+        range(len(FIXED_LEGO_PALETTE)),
+        key=lambda index: color_distance_sq(color, FIXED_LEGO_PALETTE[index][1]),
+    )
 
 
 def set_material_base_color(material, color):
@@ -69,57 +127,35 @@ def apply_single_material_to_object(obj, material):
     mesh.update()
 
 
-def update_live_palette_slot(settings, context, slot_index):
-    if settings.get("_mv_palette_sync", False):
-        return
-    apply_palette_display_colors(settings, context)
+def update_palette_slot_material(settings, context, slot_index):
+    color = get_fixed_palette_color(getattr(settings, f"lego_palette_slot_{slot_index + 1}"))
+    setattr(settings, f"lego_palette_slot_color_{slot_index + 1}", color)
 
-
-def sync_palette_properties(settings, colors):
-    settings["_mv_palette_sync"] = True
-    try:
-        for slot_index in range(4):
-            color = colors[slot_index] if slot_index < len(colors) else (0.8, 0.8, 0.8)
-            setattr(settings, f"lego_palette_color_{slot_index + 1}", color)
-    finally:
-        settings["_mv_palette_sync"] = False
-
-
-def get_debug_slot_colors():
-    return [
-        (1.0, 0.0, 0.0),
-        (0.0, 1.0, 0.0),
-        (0.0, 0.0, 1.0),
-        (1.0, 1.0, 1.0),
-    ]
-
-
-def apply_palette_display_colors(settings, context):
     obj = context.active_object
     if obj is None or obj.type != 'MESH':
         return
 
-    mesh = obj.data
-    display_colors = (
-        get_debug_slot_colors()
-        if settings.lego_debug_colors
-        else [
-            tuple(settings.lego_palette_color_1),
-            tuple(settings.lego_palette_color_2),
-            tuple(settings.lego_palette_color_3),
-            tuple(settings.lego_palette_color_4),
-        ]
-    )
+    if slot_index >= len(obj.data.materials):
+        return
 
-    for slot_index, color in enumerate(display_colors):
-        if slot_index < len(mesh.materials):
-            set_material_base_color(mesh.materials[slot_index], color)
-
-    mesh.update()
+    set_material_base_color(obj.data.materials[slot_index], color)
+    obj.data.update()
 
 
-def update_lego_debug_colors(settings, context):
-    apply_palette_display_colors(settings, context)
+def update_lego_palette_slot_1(settings, context):
+    update_palette_slot_material(settings, context, 0)
+
+
+def update_lego_palette_slot_2(settings, context):
+    update_palette_slot_material(settings, context, 1)
+
+
+def update_lego_palette_slot_3(settings, context):
+    update_palette_slot_material(settings, context, 2)
+
+
+def update_lego_palette_slot_4(settings, context):
+    update_palette_slot_material(settings, context, 3)
 
 
 def update_color_skin_base_slot(settings, context):
@@ -130,20 +166,9 @@ def update_color_skin_base_slot(settings, context):
     settings["color_skin_slot_4"] = (base_slot_index != 3)
 
 
-def update_lego_palette_color_1(settings, context):
-    update_live_palette_slot(settings, context, 0)
-
-
-def update_lego_palette_color_2(settings, context):
-    update_live_palette_slot(settings, context, 1)
-
-
-def update_lego_palette_color_3(settings, context):
-    update_live_palette_slot(settings, context, 2)
-
-
-def update_lego_palette_color_4(settings, context):
-    update_live_palette_slot(settings, context, 3)
+def update_lego_color_count(settings, context):
+    if settings.selected_lego_palette_slot >= settings.lego_color_count:
+        settings.selected_lego_palette_slot = settings.lego_color_count - 1
 
 
 def get_view3d_window_region(area):
@@ -151,6 +176,26 @@ def get_view3d_window_region(area):
         if region.type == 'WINDOW':
             return region
     return None
+
+
+def is_event_in_region(region, event):
+    return (
+        region.x <= event.mouse_x <= region.x + region.width and
+        region.y <= event.mouse_y <= region.y + region.height
+    )
+
+
+def is_event_in_view3d_ui_region(context, event):
+    if context.area is None or context.area.type != 'VIEW_3D':
+        return False
+
+    for region in context.area.regions:
+        if region.type == 'WINDOW':
+            continue
+        if region.type in {'UI', 'TOOLS', 'HEADER', 'TOOL_HEADER'} and is_event_in_region(region, event):
+            return True
+
+    return False
 
 
 def raycast_active_face(context, event):
@@ -187,6 +232,74 @@ def raycast_active_face(context, event):
         return obj, face_index
 
     return obj, None
+
+
+def get_mouse_region_coord(context, event):
+    if context.area is None or context.area.type != 'VIEW_3D':
+        return None, None, None
+
+    region = get_view3d_window_region(context.area)
+    region_3d = getattr(context.space_data, "region_3d", None)
+    if region is None or region_3d is None:
+        return None, None, None
+
+    mouse_x = event.mouse_x - region.x
+    mouse_y = event.mouse_y - region.y
+
+    if mouse_x < 0 or mouse_y < 0 or mouse_x > region.width or mouse_y > region.height:
+        return None, None, None
+
+    return region, region_3d, (mouse_x, mouse_y)
+
+
+def get_polygon_center(mesh, poly):
+    center = Vector((0.0, 0.0, 0.0))
+    for vertex_index in poly.vertices:
+        center += mesh.vertices[vertex_index].co
+    return center / max(1, len(poly.vertices))
+
+
+def paint_faces_with_brush(context, event, obj, slot_index, brush_size):
+    hit_obj, face_index = raycast_active_face(context, event)
+    if hit_obj is None or face_index is None:
+        return 0
+
+    mesh = hit_obj.data
+    radius = max(1.0, float(brush_size))
+    changed_count = 0
+
+    if radius <= 1.0:
+        if mesh.polygons[face_index].material_index != slot_index:
+            mesh.polygons[face_index].material_index = slot_index
+            changed_count = 1
+        mesh.update()
+        return changed_count
+
+    region, region_3d, mouse_coord = get_mouse_region_coord(context, event)
+    if region is None:
+        return 0
+
+    radius_sq = radius * radius
+    faces_to_paint = {face_index}
+
+    for poly in mesh.polygons:
+        center = hit_obj.matrix_world @ get_polygon_center(mesh, poly)
+        screen_coord = view3d_utils.location_3d_to_region_2d(region, region_3d, center)
+        if screen_coord is None:
+            continue
+
+        dx = screen_coord.x - mouse_coord[0]
+        dy = screen_coord.y - mouse_coord[1]
+        if (dx * dx) + (dy * dy) <= radius_sq:
+            faces_to_paint.add(poly.index)
+
+    for paint_face_index in faces_to_paint:
+        if mesh.polygons[paint_face_index].material_index != slot_index:
+            mesh.polygons[paint_face_index].material_index = slot_index
+            changed_count += 1
+
+    mesh.update()
+    return changed_count
 
 
 # ------------------------------------------------------------
@@ -237,14 +350,6 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
         max=128,
     )
 
-    lego_color_count: IntProperty(
-        name="Number of Colors",
-        description="How many flat Lego colors to create and assign to faces",
-        default=4,
-        min=1,
-        max=4,
-    )
-
     lego_color_sample_mode: EnumProperty(
         name="Texture Read",
         description="How each face reads color from the texture",
@@ -256,12 +361,21 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
         default='AVERAGE',
     )
 
+    lego_color_count: IntProperty(
+        name="Number of Colors",
+        description="How many fixed palette colors to create and assign to faces",
+        default=4,
+        min=1,
+        max=4,
+        update=update_lego_color_count,
+    )
+
     lego_color_assign_mode: EnumProperty(
         name="Color Assignment",
         description="How sampled texture colors are grouped into Lego materials",
         items=[
-            ('ADAPTIVE', "Adaptive Palette", "Build a palette from the sampled face colors and assign each face to the closest color"),
-            ('LUMINANCE', "Brightness Bands", "Group faces by brightness and create one flat material per brightness band"),
+            ('ADAPTIVE', "Adaptive Palette", "Build up to four color groups from sampled face colors"),
+            ('LUMINANCE', "Brightness Bands", "Group faces by brightness into up to four bands"),
         ],
         default='ADAPTIVE',
     )
@@ -291,57 +405,95 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
         max=32,
     )
 
-    lego_palette_color_1: FloatVectorProperty(
+    selected_lego_palette_slot: IntProperty(
+        name="Selected Color",
+        description="Palette color used by the paint brush",
+        default=0,
+        min=0,
+        max=3,
+    )
+
+    lego_palette_slot_1: EnumProperty(
         name="Slot 1",
+        description="Fixed palette color for material slot 1",
+        items=FIXED_LEGO_PALETTE_ITEMS,
+        default='12',
+        update=update_lego_palette_slot_1,
+    )
+
+    lego_palette_slot_color_1: FloatVectorProperty(
+        name="Slot 1 Color",
         subtype='COLOR',
         size=3,
         min=0.0,
         max=1.0,
-        default=(0.835, 0.129, 0.094),
-        update=update_lego_palette_color_1,
+        default=FIXED_LEGO_PALETTE[12][1],
     )
 
-    lego_palette_color_2: FloatVectorProperty(
+    lego_palette_slot_2: EnumProperty(
         name="Slot 2",
+        description="Fixed palette color for material slot 2",
+        items=FIXED_LEGO_PALETTE_ITEMS,
+        default='15',
+        update=update_lego_palette_slot_2,
+    )
+
+    lego_palette_slot_color_2: FloatVectorProperty(
+        name="Slot 2 Color",
         subtype='COLOR',
         size=3,
         min=0.0,
         max=1.0,
-        default=(0.929, 0.764, 0.114),
-        update=update_lego_palette_color_2,
+        default=FIXED_LEGO_PALETTE[15][1],
     )
 
-    lego_palette_color_3: FloatVectorProperty(
+    lego_palette_slot_3: EnumProperty(
         name="Slot 3",
+        description="Fixed palette color for material slot 3",
+        items=FIXED_LEGO_PALETTE_ITEMS,
+        default='5',
+        update=update_lego_palette_slot_3,
+    )
+
+    lego_palette_slot_color_3: FloatVectorProperty(
+        name="Slot 3 Color",
         subtype='COLOR',
         size=3,
         min=0.0,
         max=1.0,
-        default=(0.102, 0.333, 0.761),
-        update=update_lego_palette_color_3,
+        default=FIXED_LEGO_PALETTE[5][1],
     )
 
-    lego_palette_color_4: FloatVectorProperty(
+    lego_palette_slot_4: EnumProperty(
         name="Slot 4",
+        description="Fixed palette color for material slot 4",
+        items=FIXED_LEGO_PALETTE_ITEMS,
+        default='3',
+        update=update_lego_palette_slot_4,
+    )
+
+    lego_palette_slot_color_4: FloatVectorProperty(
+        name="Slot 4 Color",
         subtype='COLOR',
         size=3,
         min=0.0,
         max=1.0,
-        default=(0.93, 0.93, 0.9),
-        update=update_lego_palette_color_4,
+        default=FIXED_LEGO_PALETTE[3][1],
     )
 
-    lego_debug_colors: BoolProperty(
-        name="Debug Colors",
-        description="Temporarily show slot colors as red, green, blue, and white for clearer visualization",
-        default=False,
-        update=update_lego_debug_colors,
+    lego_paint_brush_size: IntProperty(
+        name="Brush Size",
+        description="Screen-space paint radius in pixels. 1 paints only the hovered face",
+        default=9,
+        min=1,
+        soft_max=80,
+        max=300,
     )
 
     outer_skin_mm: FloatProperty(
         name="Outer Skin (mm)",
         description="Outward skin thickness in millimeters",
-        default=3.0,
+        default=0.3,
         min=0.02,
         soft_max=100.0,
         precision=3,
@@ -349,7 +501,7 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
 
     inset_amount: FloatProperty(
         name="Inset",
-        default=0.006,
+        default=0.0006,
         min=0.0,
         soft_max=1.0,
         precision=4,
@@ -358,7 +510,7 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
     inside_skin_mm: FloatProperty(
         name="Inner Skin (mm)",
         description="Inward movement in millimeters. Cannot be positive",
-        default=-2.0,
+        default=-0.2,
         max=0.0,
         soft_min=-100.0,
         precision=3,
@@ -382,32 +534,11 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
     color_skin_slot_3: BoolProperty(name="Slot 3", default=True)
     color_skin_slot_4: BoolProperty(name="Slot 4", default=True)
 
-    do_pos_x: BoolProperty(name="+X", default=True)
-    do_neg_x: BoolProperty(name="-X", default=False)
-    do_pos_y: BoolProperty(name="+Y", default=False)
-    do_neg_y: BoolProperty(name="-Y", default=False)
-    do_pos_z: BoolProperty(name="+Z", default=False)
-    do_neg_z: BoolProperty(name="-Z", default=False)
-
     make_boolean_base: BoolProperty(
         name="Boolean-Difference base.",
         description="Apply Boolean Difference on the base object using the generated skin objects",
         default=False,
     )
-
-
-# ------------------------------------------------------------
-# Axis config
-# ------------------------------------------------------------
-
-AXIS_CONFIGS = [
-    ("do_pos_x", "+X", "X",  Vector(( 1.0,  0.0,  0.0))),
-    ("do_neg_x", "-X", "-X", Vector((-1.0,  0.0,  0.0))),
-    ("do_pos_y", "+Y", "Y",  Vector(( 0.0,  1.0,  0.0))),
-    ("do_neg_y", "-Y", "-Y", Vector(( 0.0, -1.0,  0.0))),
-    ("do_pos_z", "+Z", "Z",  Vector(( 0.0,  0.0,  1.0))),
-    ("do_neg_z", "-Z", "-Z", Vector(( 0.0,  0.0, -1.0))),
-]
 
 
 # ------------------------------------------------------------
@@ -454,10 +585,6 @@ def get_blocks_name(root_name):
 
 def get_base_name(root_name):
     return f"{root_name}_Blocks_Base"
-
-
-def get_skin_name(root_name, axis_suffix):
-    return f"{root_name}_Blocks_Skin_{axis_suffix}"
 
 
 def get_color_base_name(root_name):
@@ -1102,16 +1229,45 @@ def build_luminance_palette(face_colors, color_count):
     return palette, assignments
 
 
-def rebuild_materials_from_assignments(obj, palette, assignments):
+def sync_slot_palette_properties(settings, palette):
+    for slot_index in range(4):
+        if slot_index < len(palette):
+            fixed_index = find_nearest_fixed_palette_index(palette[slot_index])
+        else:
+            fixed_index = int(getattr(settings, f"lego_palette_slot_{slot_index + 1}"))
+        setattr(settings, f"lego_palette_slot_{slot_index + 1}", str(fixed_index))
+        setattr(settings, f"lego_palette_slot_color_{slot_index + 1}", FIXED_LEGO_PALETTE[fixed_index][1])
+
+
+def get_slot_palette_color(settings, slot_index):
+    fixed_index = getattr(settings, f"lego_palette_slot_{slot_index + 1}")
+    return get_fixed_palette_color(fixed_index)
+
+
+def rebuild_materials_from_assignments(obj, settings, assignments, color_count):
     mesh = obj.data
     mesh.materials.clear()
 
-    for palette_index, color in enumerate(palette):
-        mesh.materials.append(ensure_lego_color_material(obj, palette_index, color))
+    for slot_index in range(color_count):
+        mesh.materials.append(ensure_lego_color_material(obj, slot_index, get_slot_palette_color(settings, slot_index)))
 
     for poly, material_index in zip(mesh.polygons, assignments):
-        poly.material_index = material_index
+        poly.material_index = min(material_index, color_count - 1)
 
+    mesh.update()
+
+
+def ensure_slot_palette_materials(obj, settings):
+    mesh = obj.data
+    for slot_index in range(settings.lego_color_count):
+        material = ensure_lego_color_material(obj, slot_index, get_slot_palette_color(settings, slot_index))
+        if slot_index < len(mesh.materials):
+            mesh.materials[slot_index] = material
+        else:
+            mesh.materials.append(material)
+
+    for poly in mesh.polygons:
+        poly.material_index = min(poly.material_index, settings.lego_color_count - 1)
     mesh.update()
 
 
@@ -1189,6 +1345,12 @@ def ensure_lego_color_material(obj, slot_index, color):
     if mat is None:
         mat = bpy.data.materials.new(mat_name)
 
+    mat.diffuse_color = (
+        clamp01(color[0]),
+        clamp01(color[1]),
+        clamp01(color[2]),
+        1.0,
+    )
     mat.use_nodes = True
     nodes = mat.node_tree.nodes
     links = mat.node_tree.links
@@ -1428,13 +1590,12 @@ class MINIATUREVOXELER_OT_lego_color(Operator):
         else:
             palette, assignments = build_adaptive_palette(face_colors, settings.lego_color_count)
 
-        rebuild_materials_from_assignments(obj, palette, assignments)
-        sync_palette_properties(settings, palette)
-        apply_palette_display_colors(settings, context)
+        sync_slot_palette_properties(settings, palette)
+        rebuild_materials_from_assignments(obj, settings, assignments, len(palette))
 
         self.report(
             {'INFO'},
-            f"Lego Color created {len(palette)} material(s) from {image.name} using {settings.lego_color_assign_mode.lower()} assignment."
+            f"Lego Color created {len(palette)} fixed-palette material(s) from {image.name} using {settings.lego_color_assign_mode.lower()} assignment."
         )
         return {'FINISHED'}
 
@@ -1492,14 +1653,85 @@ class MINIATUREVOXELER_OT_paint_lego_slot(Operator):
 
     slot_index: IntProperty(default=0, min=0, max=3)
 
+    @staticmethod
+    def draw_brush_overlay(operator, context):
+        mouse_coord = getattr(operator, "_mouse_region_coord", None)
+        if mouse_coord is None:
+            return
+
+        settings = context.scene.miniature_voxeler_settings
+        radius = max(1.0, float(settings.lego_paint_brush_size))
+        segments = 64
+        x, y = mouse_coord
+        coords = [
+            (
+                x + cos((2.0 * pi * index) / segments) * radius,
+                y + sin((2.0 * pi * index) / segments) * radius,
+            )
+            for index in range(segments + 1)
+        ]
+
+        try:
+            shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+        except ValueError:
+            shader = gpu.shader.from_builtin('2D_UNIFORM_COLOR')
+        batch = batch_for_shader(shader, 'LINE_STRIP', {"pos": coords})
+
+        gpu.state.blend_set('ALPHA')
+        gpu.state.line_width_set(2.0)
+        shader.bind()
+        if getattr(operator, "_is_resizing_brush", False):
+            shader.uniform_float("color", (1.0, 0.82, 0.18, 0.95))
+        elif getattr(operator, "_is_picking_color", False):
+            shader.uniform_float("color", (0.25, 0.72, 1.0, 0.95))
+        else:
+            shader.uniform_float("color", (1.0, 1.0, 1.0, 0.9))
+        batch.draw(shader)
+        gpu.state.line_width_set(1.0)
+        gpu.state.blend_set('NONE')
+
     def update_modal_cursor(self, context, event=None):
         if context.window is None:
             return
 
-        cursor = 'EYEDROPPER' if event is not None and event.shift else 'PAINT_BRUSH'
+        cursor = 'EYEDROPPER' if getattr(self, "_is_picking_color", False) else 'PAINT_BRUSH'
         if getattr(self, "_current_cursor", None) != cursor:
             context.window.cursor_modal_set(cursor)
             self._current_cursor = cursor
+
+    def add_draw_handler(self, context):
+        if getattr(self, "_draw_handler", None) is None:
+            self._draw_handler = bpy.types.SpaceView3D.draw_handler_add(
+                self.draw_brush_overlay,
+                (self, context),
+                'WINDOW',
+                'POST_PIXEL',
+            )
+
+    def remove_draw_handler(self, context):
+        if getattr(self, "_draw_handler", None) is not None:
+            bpy.types.SpaceView3D.draw_handler_remove(self._draw_handler, 'WINDOW')
+            self._draw_handler = None
+            if context.area:
+                context.area.tag_redraw()
+
+    def finish_modal(self, context, message=None):
+        if type(self)._active_painter is self:
+            type(self)._active_painter = None
+        context.scene.miniature_voxeler_settings.selected_lego_palette_slot = 0
+        self.remove_draw_handler(context)
+        self.restore_modal_cursor(context)
+        if message:
+            self.report({'INFO'}, message)
+        return {'FINISHED'}
+
+    def cancel_modal(self, context):
+        if type(self)._active_painter is self:
+            type(self)._active_painter = None
+        context.scene.miniature_voxeler_settings.selected_lego_palette_slot = 0
+        self.remove_draw_handler(context)
+        self.restore_modal_cursor(context)
+        return {'CANCELLED'}
 
     def restore_modal_cursor(self, context):
         if context.window is None:
@@ -1520,9 +1752,12 @@ class MINIATUREVOXELER_OT_paint_lego_slot(Operator):
             self.report({'ERROR'}, "Select a mesh object first.")
             return {'CANCELLED'}
 
-        if self.slot_index >= len(obj.data.materials):
-            self.report({'ERROR'}, "Run Lego Color first so palette slots exist.")
+        settings = context.scene.miniature_voxeler_settings
+        if self.slot_index >= settings.lego_color_count:
+            self.report({'ERROR'}, "This paint slot is not enabled by Number of Colors.")
             return {'CANCELLED'}
+
+        ensure_slot_palette_materials(obj, settings)
 
         if context.area is None or context.area.type != 'VIEW_3D':
             self.report({'ERROR'}, "Start paint mode from a 3D View.")
@@ -1534,8 +1769,10 @@ class MINIATUREVOXELER_OT_paint_lego_slot(Operator):
         previous = type(self)._active_painter
         if previous is not None and previous is not self and not getattr(previous, "_cancel_requested", False):
             previous.slot_index = self.slot_index
-            previous._last_face_index = None
             previous._is_painting = False
+            previous._is_picking_color = False
+            previous._is_resizing_brush = False
+            context.scene.miniature_voxeler_settings.selected_lego_palette_slot = self.slot_index
             previous.update_modal_cursor(context, event)
             self.report({'INFO'}, f"Switched paint brush to slot {self.slot_index + 1}.")
             return {'FINISHED'}
@@ -1545,67 +1782,123 @@ class MINIATUREVOXELER_OT_paint_lego_slot(Operator):
 
         self._cancel_requested = False
         self._is_painting = False
-        self._last_face_index = None
+        self._is_picking_color = False
+        self._is_resizing_brush = False
+        self._mouse_region_coord = None
+        self._draw_handler = None
         self._current_cursor = None
+        context.scene.miniature_voxeler_settings.selected_lego_palette_slot = self.slot_index
         type(self)._active_painter = self
 
+        self.add_draw_handler(context)
         context.window_manager.modal_handler_add(self)
         self.update_modal_cursor(context, event)
-        self.report({'INFO'}, f"Painting slot {self.slot_index + 1}. Left-drag paints, Shift picks hovered slot, right-click or Esc stops.")
+        self.report({'INFO'}, f"Painting slot {self.slot_index + 1}. Left-drag paints, I then click picks a slot, F resizes brush, right-click or Esc stops.")
         return {'RUNNING_MODAL'}
 
     def modal(self, context, event):
         if context.area:
             context.area.tag_redraw()
 
+        if not self._is_resizing_brush and is_event_in_view3d_ui_region(context, event):
+            self._mouse_region_coord = None
+            return {'PASS_THROUGH'}
+
+        if self._is_resizing_brush:
+            self._mouse_region_coord = self._brush_resize_region_coord
+            mouse_coord = self._brush_resize_region_coord
+        else:
+            _, _, mouse_coord = get_mouse_region_coord(context, event)
+            if mouse_coord is not None:
+                self._mouse_region_coord = mouse_coord
+            else:
+                self._mouse_region_coord = None
+
         self.update_modal_cursor(context, event)
 
         if self._cancel_requested:
-            if type(self)._active_painter is self:
-                type(self)._active_painter = None
-            self.restore_modal_cursor(context)
-            return {'FINISHED'}
+            return self.finish_modal(context)
+
+        settings = context.scene.miniature_voxeler_settings
+
+        if mouse_coord is None and event.type in {'LEFTMOUSE', 'MIDDLEMOUSE', 'RIGHTMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}:
+            return {'PASS_THROUGH'}
+
+        if self._is_resizing_brush:
+            if event.type == 'MOUSEMOVE':
+                distance = hypot(
+                    event.mouse_x - self._brush_resize_start_x,
+                    event.mouse_y - self._brush_resize_start_y,
+                )
+                settings.lego_paint_brush_size = max(1, min(300, int(distance)))
+                return {'RUNNING_MODAL'}
+            if event.type in {'LEFTMOUSE', 'RET', 'NUMPAD_ENTER', 'SPACE'} and event.value == 'PRESS':
+                self._is_resizing_brush = False
+                self.report({'INFO'}, f"Brush size: {settings.lego_paint_brush_size}")
+                return {'RUNNING_MODAL'}
+            if event.type in {'RIGHTMOUSE', 'ESC'} and event.value == 'PRESS':
+                settings.lego_paint_brush_size = self._brush_resize_start_size
+                self._is_resizing_brush = False
+                return {'RUNNING_MODAL'}
+            return {'RUNNING_MODAL'}
 
         if event.type in {'RIGHTMOUSE', 'ESC'}:
-            if type(self)._active_painter is self:
-                type(self)._active_painter = None
-            self.restore_modal_cursor(context)
-            self.report({'INFO'}, "Paint Lego Slot finished.")
-            return {'FINISHED'}
+            if self._is_picking_color:
+                self._is_picking_color = False
+                self.update_modal_cursor(context, event)
+                return {'RUNNING_MODAL'}
+            return self.finish_modal(context, "Paint Lego Slot finished.")
 
         obj = context.active_object
         if obj is None or obj.type != 'MESH':
-            if type(self)._active_painter is self:
-                type(self)._active_painter = None
-            self.restore_modal_cursor(context)
-            return {'CANCELLED'}
+            return self.cancel_modal(context)
+
+        if event.type == 'F' and event.value == 'PRESS':
+            self._is_resizing_brush = True
+            self._brush_resize_start_x = event.mouse_x
+            self._brush_resize_start_y = event.mouse_y
+            self._brush_resize_start_size = settings.lego_paint_brush_size
+            _, _, self._brush_resize_region_coord = get_mouse_region_coord(context, event)
+            self.report({'INFO'}, "Move mouse to resize brush, left-click confirms, right-click cancels.")
+            return {'RUNNING_MODAL'}
+
+        if event.type == 'I' and event.value == 'PRESS':
+            self._is_picking_color = True
+            self._is_painting = False
+            self.update_modal_cursor(context, event)
+            self.report({'INFO'}, "Color picker active. Click a face to pick its slot.")
+            return {'RUNNING_MODAL'}
+
+        if self._is_picking_color:
+            if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+                hit_obj, face_index = raycast_active_face(context, event)
+                if hit_obj is not None and face_index is not None:
+                    picked_slot = hit_obj.data.polygons[face_index].material_index
+                    if 0 <= picked_slot < settings.lego_color_count:
+                        self.slot_index = picked_slot
+                        settings.selected_lego_palette_slot = picked_slot
+                        self._is_picking_color = False
+                        self.update_modal_cursor(context, event)
+                        self.report({'INFO'}, f"Picked slot {self.slot_index + 1}.")
+                return {'RUNNING_MODAL'}
+            return {'RUNNING_MODAL'}
 
         if event.type == 'LEFTMOUSE':
             if event.value == 'PRESS':
                 self._is_painting = True
             elif event.value == 'RELEASE':
                 self._is_painting = False
-                self._last_face_index = None
                 return {'RUNNING_MODAL'}
-
-        if event.shift:
-            hit_obj, face_index = raycast_active_face(context, event)
-            if hit_obj is not None and face_index is not None:
-                picked_slot = hit_obj.data.polygons[face_index].material_index
-                if 0 <= picked_slot < len(hit_obj.data.materials):
-                    self.slot_index = picked_slot
-                    self._last_face_index = None
-                    if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
-                        self.report({'INFO'}, f"Picked slot {self.slot_index + 1}.")
-                    return {'RUNNING_MODAL'}
 
         if self._is_painting and event.type in {'LEFTMOUSE', 'MOUSEMOVE'}:
-            hit_obj, face_index = raycast_active_face(context, event)
-            if hit_obj is not None and face_index is not None and face_index != self._last_face_index:
-                hit_obj.data.polygons[face_index].material_index = self.slot_index
-                hit_obj.data.update()
-                self._last_face_index = face_index
-                return {'RUNNING_MODAL'}
+            paint_faces_with_brush(
+                context,
+                event,
+                obj,
+                self.slot_index,
+                settings.lego_paint_brush_size,
+            )
+            return {'RUNNING_MODAL'}
 
         return {'PASS_THROUGH'}
 
@@ -1631,9 +1924,6 @@ class MINIATUREVOXELER_OT_generate_color_skin(Operator):
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
 
-        if settings.lego_debug_colors:
-            settings.lego_debug_colors = False
-
         base_slot_index = int(settings.color_skin_base_slot)
         enabled_skin_slots = [slot_index for slot_index in get_enabled_color_skin_slots(settings) if slot_index != base_slot_index]
 
@@ -1658,7 +1948,7 @@ class MINIATUREVOXELER_OT_generate_color_skin(Operator):
         base_material = ensure_lego_color_material(
             base_obj,
             0,
-            get_material_base_color(original_obj.data.materials[base_slot_index]) if base_slot_index < len(original_obj.data.materials) else (0.8, 0.8, 0.8),
+            get_slot_palette_color(settings, base_slot_index),
         )
         apply_single_material_to_object(base_obj, base_material)
 
@@ -1756,124 +2046,6 @@ class MINIATUREVOXELER_OT_generate_color_skin(Operator):
 
 
 # ------------------------------------------------------------
-# Operator 8: North South Skin Separation
-# ------------------------------------------------------------
-
-class MINIATUREVOXELER_OT_generate_skin(Operator):
-    bl_idname = "object.miniature_voxeler_generate_skin"
-    bl_label = "North South Skin Separation"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return obj is not None and obj.type == 'MESH'
-
-    def execute(self, context):
-        settings = context.scene.miniature_voxeler_settings
-        body_obj = context.active_object
-
-        if context.mode != 'OBJECT':
-            bpy.ops.object.mode_set(mode='OBJECT')
-
-        enabled_axes = []
-        for prop_name, label, suffix, axis_vec in AXIS_CONFIGS:
-            if getattr(settings, prop_name):
-                enabled_axes.append((label, suffix, axis_vec))
-
-        if not enabled_axes:
-            self.report({'WARNING'}, "No axis checkbox is enabled.")
-            return {'CANCELLED'}
-
-        root_name = get_root_name(body_obj.name)
-        source_name = get_inferred_source_name(settings, body_obj)
-
-        body_obj.name = get_base_name(root_name)
-        base_obj = body_obj
-        set_metadata(base_obj, root_name, source_name)
-
-        temp_source = duplicate_object(
-            context,
-            base_obj,
-            f"{base_obj.name}_TEMP"
-        )
-        set_metadata(temp_source, root_name, source_name)
-
-        processed = []
-        skipped = []
-        skin_objects = []
-
-        for label, suffix, axis_vec in enabled_axes:
-            if temp_source.name not in bpy.data.objects:
-                self.report({'ERROR'}, "Temporary source object became invalid.")
-                return {'CANCELLED'}
-
-            set_active_object(context, temp_source)
-
-            bpy.ops.object.mode_set(mode='EDIT')
-            bpy.ops.mesh.select_mode(type='FACE')
-            bpy.ops.mesh.select_all(action='DESELECT')
-
-            bm = bmesh.from_edit_mesh(temp_source.data)
-            bm.faces.ensure_lookup_table()
-            bm.normal_update()
-
-            selected_count = 0
-            for face in bm.faces:
-                match = face_matches_world_axis(temp_source, face, axis_vec)
-                face.select = match
-                if match:
-                    selected_count += 1
-
-            bmesh.update_edit_mesh(temp_source.data, loop_triangles=False, destructive=False)
-
-            if selected_count == 0:
-                bpy.ops.object.mode_set(mode='OBJECT')
-                skipped.append(label)
-                continue
-
-            pre_names = set(obj.name for obj in bpy.data.objects)
-
-            bpy.ops.mesh.separate(type='SELECTED')
-            bpy.ops.object.mode_set(mode='OBJECT')
-
-            new_obj = find_new_object(pre_names, temp_source, context)
-            if new_obj is None:
-                self.report({'ERROR'}, f"Could not identify separated skin object for {label}.")
-                return {'CANCELLED'}
-
-            new_obj.name = get_skin_name(root_name, suffix)
-            set_metadata(new_obj, root_name, source_name)
-            process_skin_object(context, new_obj, settings, axis_vec)
-
-            skin_objects.append(new_obj)
-            processed.append(f"{label} ({selected_count} faces)")
-
-        if settings.make_boolean_base and skin_objects:
-            for i, skin_obj in enumerate(skin_objects):
-                apply_boolean_difference(context, base_obj, skin_obj, i)
-
-        if temp_source.name in bpy.data.objects:
-            bpy.data.objects.remove(temp_source, do_unlink=True)
-
-        set_active_object(context, base_obj)
-
-        if not processed:
-            self.report({'WARNING'}, "No matching faces found for the checked axes.")
-            return {'CANCELLED'}
-
-        msg = "Processed: " + ", ".join(processed)
-        if skipped:
-            msg += " | Skipped: " + ", ".join(skipped)
-        if settings.make_boolean_base:
-            msg += " | Boolean-Difference base. applied"
-        msg += " | Temp source deleted"
-
-        self.report({'INFO'}, msg)
-        return {'FINISHED'}
-
-
-# ------------------------------------------------------------
 # Panel
 # ------------------------------------------------------------
 
@@ -1932,28 +2104,31 @@ class MINIATUREVOXELER_PT_panel(Panel):
 
         palette_box = box.box()
         palette_box.label(text="Palette Slots")
-        palette_box.prop(settings, "lego_debug_colors")
+        palette_box.prop(settings, "lego_paint_brush_size")
         palette_col = palette_box.column(align=True)
-        row = palette_col.row(align=True)
-        row.prop(settings, "lego_palette_color_1")
-        op = row.operator("object.miniature_voxeler_paint_lego_slot", text="", icon='BRUSH_DATA')
-        op.slot_index = 0
-        if settings.lego_color_count >= 2:
+        active_painter = MINIATUREVOXELER_OT_paint_lego_slot._active_painter
+
+        for slot_index in range(settings.lego_color_count):
             row = palette_col.row(align=True)
-            row.prop(settings, "lego_palette_color_2")
-            op = row.operator("object.miniature_voxeler_paint_lego_slot", text="", icon='BRUSH_DATA')
-            op.slot_index = 1
-        if settings.lego_color_count >= 3:
-            row = palette_col.row(align=True)
-            row.prop(settings, "lego_palette_color_3")
-            op = row.operator("object.miniature_voxeler_paint_lego_slot", text="", icon='BRUSH_DATA')
-            op.slot_index = 2
-        if settings.lego_color_count >= 4:
-            row = palette_col.row(align=True)
-            row.prop(settings, "lego_palette_color_4")
-            op = row.operator("object.miniature_voxeler_paint_lego_slot", text="", icon='BRUSH_DATA')
-            op.slot_index = 3
-        palette_box.label(text="Brush: left-drag paint, Shift picks hovered slot")
+            swatch = row.row(align=True)
+            swatch.enabled = False
+            swatch.prop(settings, f"lego_palette_slot_color_{slot_index + 1}", text="")
+            row.prop(settings, f"lego_palette_slot_{slot_index + 1}")
+            is_active_paint_slot = (
+                active_painter is not None and
+                not getattr(active_painter, "_cancel_requested", False) and
+                active_painter.slot_index == slot_index
+            )
+            icon = 'RADIOBUT_ON' if is_active_paint_slot else 'RADIOBUT_OFF'
+            op = row.operator(
+                "object.miniature_voxeler_paint_lego_slot",
+                text="",
+                icon=icon,
+                depress=is_active_paint_slot,
+            )
+            op.slot_index = slot_index
+
+        palette_box.label(text="Brush: left-drag paint, F resize, I then click picks")
 
         box = layout.box()
         box.label(text="Lego Skin")
@@ -1975,31 +2150,6 @@ class MINIATUREVOXELER_PT_panel(Panel):
 
         box.operator("object.miniature_voxeler_generate_color_skin", text="Generate Lego Skin", icon='MATERIAL')
 
-        box = layout.box()
-        box.label(text="North South Skin Separation")
-        col = box.column(align=True)
-        col.prop(settings, "outer_skin_mm")
-        col.prop(settings, "inset_amount")
-        col.prop(settings, "inside_skin_mm")
-        col.prop(settings, "make_boolean_base")
-
-        box.label(text="Sides")
-
-        row = box.row(align=True)
-        row.prop(settings, "do_pos_x")
-        row.prop(settings, "do_neg_x")
-
-        row = box.row(align=True)
-        row.prop(settings, "do_pos_y")
-        row.prop(settings, "do_neg_y")
-
-        row = box.row(align=True)
-        row.prop(settings, "do_pos_z")
-        row.prop(settings, "do_neg_z")
-
-        box.operator("object.miniature_voxeler_generate_skin", icon='FACESEL')
-
-
 # ------------------------------------------------------------
 # Register
 # ------------------------------------------------------------
@@ -2013,7 +2163,6 @@ classes = (
     MINIATUREVOXELER_OT_smooth_lego_color,
     MINIATUREVOXELER_OT_paint_lego_slot,
     MINIATUREVOXELER_OT_generate_color_skin,
-    MINIATUREVOXELER_OT_generate_skin,
     MINIATUREVOXELER_PT_panel,
 )
 
