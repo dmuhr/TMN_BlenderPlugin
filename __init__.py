@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Miniature Voxeler",
     "author": "OpenAI",
-    "version": (2, 0, 9),
+    "version": (2, 1, 0),
     "blender": (5, 0, 1),
     "location": "3D View > Sidebar > Miniature Voxeler",
     "description": "Block remesh, transfer texture, create Lego-color face materials, and generate Lego skin meshes for miniature voxel workflows",
@@ -26,7 +26,7 @@ from bpy.props import (
     EnumProperty,
 )
 
-ADDON_VERSION_TEXT = "v.2.0.9"
+ADDON_VERSION_TEXT = "v.2.1.0"
 
 
 def srgb_channel_to_linear(value):
@@ -131,8 +131,8 @@ def update_palette_slot_material(settings, context, slot_index):
     color = get_fixed_palette_color(getattr(settings, f"lego_palette_slot_{slot_index + 1}"))
     setattr(settings, f"lego_palette_slot_color_{slot_index + 1}", color)
 
-    obj = context.active_object
-    if obj is None or obj.type != 'MESH':
+    obj = get_blocks_object(settings)
+    if obj is None:
         return
 
     if slot_index >= len(obj.data.materials):
@@ -171,6 +171,54 @@ def update_lego_color_count(settings, context):
         settings.selected_lego_palette_slot = settings.lego_color_count - 1
 
 
+def get_building_object(settings):
+    obj = getattr(settings, "building_object", None)
+    if obj is None or obj.type != 'MESH':
+        return None
+    return obj
+
+
+def get_platform_object(settings):
+    obj = getattr(settings, "platform_object", None)
+    if obj is None or obj.type != 'MESH':
+        return None
+    return obj
+
+
+def has_building_object(context):
+    settings = getattr(context.scene, "miniature_voxeler_settings", None)
+    if settings is None:
+        return False
+    return get_building_object(settings) is not None
+
+
+def get_blocks_object(settings):
+    building_obj = get_building_object(settings)
+    if building_obj is None:
+        return None
+
+    blocks_name = get_blocks_name(get_root_name(building_obj.name))
+    blocks_obj = bpy.data.objects.get(blocks_name)
+    if blocks_obj is None or blocks_obj.type != 'MESH':
+        return None
+    return blocks_obj
+
+
+def has_blocks_object(context):
+    settings = getattr(context.scene, "miniature_voxeler_settings", None)
+    if settings is None:
+        return False
+    return get_blocks_object(settings) is not None
+
+
+def get_texture_source_object(settings):
+    override_name = settings.texture_source_name.strip()
+    if override_name:
+        return bpy.data.objects.get(override_name)
+
+    return get_building_object(settings)
+
+
 def get_view3d_window_region(area):
     for region in area.regions:
         if region.type == 'WINDOW':
@@ -199,8 +247,12 @@ def is_event_in_view3d_ui_region(context, event):
 
 
 def raycast_active_face(context, event):
-    obj = context.active_object
-    if obj is None or obj.type != 'MESH':
+    settings = getattr(context.scene, "miniature_voxeler_settings", None)
+    if settings is None:
+        return None, None
+
+    obj = get_blocks_object(settings)
+    if obj is None:
         return None, None
 
     if context.area is None or context.area.type != 'VIEW_3D':
@@ -307,6 +359,20 @@ def paint_faces_with_brush(context, event, obj, slot_index, brush_size):
 # ------------------------------------------------------------
 
 class MINIATUREVOXELER_PG_settings(PropertyGroup):
+    building_object: PointerProperty(
+        name="Building",
+        description="Mesh object used for all voxel and skin operations",
+        type=bpy.types.Object,
+        poll=lambda self, obj: obj is not None and obj.type == 'MESH',
+    )
+
+    platform_object: PointerProperty(
+        name="Platform",
+        description="Mesh object reserved as the platform reference",
+        type=bpy.types.Object,
+        poll=lambda self, obj: obj is not None and obj.type == 'MESH',
+    )
+
     octree_depth: IntProperty(
         name="Octree Depth",
         default=7,
@@ -1229,10 +1295,40 @@ def build_luminance_palette(face_colors, color_count):
     return palette, assignments
 
 
+def assign_distinct_fixed_palette_indices(palette):
+    if not palette:
+        return []
+
+    available_indices = list(range(len(FIXED_LEGO_PALETTE)))
+    fixed_colors = [color for _, color in FIXED_LEGO_PALETTE]
+    assignments = [0] * len(palette)
+
+    # Assign the hardest-to-match colors first so close colors don't consume the same fixed slot.
+    palette_order = sorted(
+        range(len(palette)),
+        key=lambda palette_index: min(
+            color_distance_sq(palette[palette_index], fixed_color)
+            for fixed_color in fixed_colors
+        ),
+        reverse=True,
+    )
+
+    for palette_index in palette_order:
+        fixed_index = min(
+            available_indices,
+            key=lambda index: color_distance_sq(palette[palette_index], fixed_colors[index]),
+        )
+        assignments[palette_index] = fixed_index
+        available_indices.remove(fixed_index)
+
+    return assignments
+
+
 def sync_slot_palette_properties(settings, palette):
+    distinct_indices = assign_distinct_fixed_palette_indices(palette)
     for slot_index in range(4):
         if slot_index < len(palette):
-            fixed_index = find_nearest_fixed_palette_index(palette[slot_index])
+            fixed_index = distinct_indices[slot_index]
         else:
             fixed_index = int(getattr(settings, f"lego_palette_slot_{slot_index + 1}"))
         setattr(settings, f"lego_palette_slot_{slot_index + 1}", str(fixed_index))
@@ -1375,7 +1471,36 @@ def ensure_lego_color_material(obj, slot_index, color):
 
 
 # ------------------------------------------------------------
-# Operator 1: Block Remesh
+# Operator 1: Apply All Transforms
+# ------------------------------------------------------------
+
+class MINIATUREVOXELER_OT_apply_all_transforms(Operator):
+    bl_idname = "object.miniature_voxeler_apply_all_transforms"
+    bl_label = "Apply All Transforms"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return has_building_object(context)
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        obj = get_building_object(settings)
+        if obj is None:
+            self.report({'ERROR'}, "Pick a Building mesh first.")
+            return {'CANCELLED'}
+
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        set_active_object(context, obj)
+        bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+        self.report({'INFO'}, f"Applied all transforms to {obj.name}")
+        return {'FINISHED'}
+
+
+# ------------------------------------------------------------
+# Operator 2: Block Remesh
 # ------------------------------------------------------------
 
 class MINIATUREVOXELER_OT_block_remesh(Operator):
@@ -1385,12 +1510,14 @@ class MINIATUREVOXELER_OT_block_remesh(Operator):
 
     @classmethod
     def poll(cls, context):
-        obj = context.active_object
-        return obj is not None and obj.type == 'MESH'
+        return has_building_object(context)
 
     def execute(self, context):
         settings = context.scene.miniature_voxeler_settings
-        source_obj = context.active_object
+        source_obj = get_building_object(settings)
+        if source_obj is None:
+            self.report({'ERROR'}, "Pick a Building mesh first.")
+            return {'CANCELLED'}
 
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
@@ -1408,6 +1535,7 @@ class MINIATUREVOXELER_OT_block_remesh(Operator):
         remesh.threshold = settings.threshold
 
         bpy.ops.object.modifier_apply(modifier=remesh.name)
+        source_obj.hide_set(True)
 
         self.report({'INFO'}, f"Created remeshed object: {new_obj.name}")
         return {'FINISHED'}
@@ -1424,11 +1552,14 @@ class MINIATUREVOXELER_OT_smart_uv_project(Operator):
 
     @classmethod
     def poll(cls, context):
-        obj = context.active_object
-        return obj is not None and obj.type == 'MESH'
+        return has_blocks_object(context)
 
     def execute(self, context):
-        obj = context.active_object
+        settings = context.scene.miniature_voxeler_settings
+        obj = get_blocks_object(settings)
+        if obj is None:
+            self.report({'ERROR'}, "Run Step 2 Block Remesh first so the _Blocks object exists.")
+            return {'CANCELLED'}
 
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
@@ -1455,12 +1586,15 @@ class MINIATUREVOXELER_OT_transfer_texture(Operator):
 
     @classmethod
     def poll(cls, context):
-        obj = context.active_object
-        return obj is not None and obj.type == 'MESH'
+        return has_blocks_object(context) and has_building_object(context)
 
     def execute(self, context):
         settings = context.scene.miniature_voxeler_settings
-        target_obj = context.active_object
+        target_obj = get_blocks_object(settings)
+        building_obj = get_building_object(settings)
+        if target_obj is None:
+            self.report({'ERROR'}, "Run Step 2 Block Remesh first so the _Blocks object exists.")
+            return {'CANCELLED'}
 
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
@@ -1469,11 +1603,10 @@ class MINIATUREVOXELER_OT_transfer_texture(Operator):
             self.report({'ERROR'}, "Target object has no UVs. Run Smart UV Project first.")
             return {'CANCELLED'}
 
-        source_name = get_inferred_source_name(settings, target_obj)
-        source_obj = bpy.data.objects.get(source_name)
+        source_obj = get_texture_source_object(settings)
 
         if source_obj is None:
-            self.report({'ERROR'}, f"Could not find source object: {source_name}")
+            self.report({'ERROR'}, "Pick a Building mesh or enter a valid Source Override.")
             return {'CANCELLED'}
 
         if source_obj == target_obj:
@@ -1489,8 +1622,13 @@ class MINIATUREVOXELER_OT_transfer_texture(Operator):
 
         scene = context.scene
         old_engine = scene.render.engine
+        should_rehide_source = (building_obj is not None and source_obj == building_obj)
+        was_source_hidden = source_obj.hide_get() if should_rehide_source else False
 
         try:
+            if should_rehide_source:
+                source_obj.hide_set(False)
+
             scene.render.engine = 'CYCLES'
 
             bake = scene.render.bake
@@ -1521,11 +1659,15 @@ class MINIATUREVOXELER_OT_transfer_texture(Operator):
                 pass
 
         except Exception as e:
+            if should_rehide_source:
+                source_obj.hide_set(was_source_hidden)
             scene.render.engine = old_engine
             self.report({'ERROR'}, f"Texture transfer failed: {str(e)}")
             return {'CANCELLED'}
 
         scene.render.engine = old_engine
+        if should_rehide_source:
+            source_obj.hide_set(True)
         set_active_object(context, target_obj)
 
         self.report({'INFO'}, f"Texture baked from {source_obj.name} to {target_obj.name}")
@@ -1543,12 +1685,14 @@ class MINIATUREVOXELER_OT_lego_color(Operator):
 
     @classmethod
     def poll(cls, context):
-        obj = context.active_object
-        return obj is not None and obj.type == 'MESH'
+        return has_blocks_object(context)
 
     def execute(self, context):
         settings = context.scene.miniature_voxeler_settings
-        obj = context.active_object
+        obj = get_blocks_object(settings)
+        if obj is None:
+            self.report({'ERROR'}, "Run Step 2 Block Remesh first so the _Blocks object exists.")
+            return {'CANCELLED'}
         mesh = obj.data
 
         if context.mode != 'OBJECT':
@@ -1611,11 +1755,14 @@ class MINIATUREVOXELER_OT_smooth_lego_color(Operator):
 
     @classmethod
     def poll(cls, context):
-        obj = context.active_object
-        return obj is not None and obj.type == 'MESH'
+        return has_blocks_object(context)
 
     def execute(self, context):
-        obj = context.active_object
+        settings = context.scene.miniature_voxeler_settings
+        obj = get_blocks_object(settings)
+        if obj is None:
+            self.report({'ERROR'}, "Run Step 2 Block Remesh first so the _Blocks object exists.")
+            return {'CANCELLED'}
         mesh = obj.data
 
         if context.mode != 'OBJECT':
@@ -1743,16 +1890,14 @@ class MINIATUREVOXELER_OT_paint_lego_slot(Operator):
 
     @classmethod
     def poll(cls, context):
-        obj = context.active_object
-        return obj is not None and obj.type == 'MESH'
+        return has_blocks_object(context)
 
     def invoke(self, context, event):
-        obj = context.active_object
-        if obj is None or obj.type != 'MESH':
-            self.report({'ERROR'}, "Select a mesh object first.")
-            return {'CANCELLED'}
-
         settings = context.scene.miniature_voxeler_settings
+        obj = get_blocks_object(settings)
+        if obj is None:
+            self.report({'ERROR'}, "Run Step 2 Block Remesh first so the _Blocks object exists.")
+            return {'CANCELLED'}
         if self.slot_index >= settings.lego_color_count:
             self.report({'ERROR'}, "This paint slot is not enabled by Number of Colors.")
             return {'CANCELLED'}
@@ -1849,8 +1994,8 @@ class MINIATUREVOXELER_OT_paint_lego_slot(Operator):
                 return {'RUNNING_MODAL'}
             return self.finish_modal(context, "Paint Lego Slot finished.")
 
-        obj = context.active_object
-        if obj is None or obj.type != 'MESH':
+        obj = get_blocks_object(settings)
+        if obj is None:
             return self.cancel_modal(context)
 
         if event.type == 'F' and event.value == 'PRESS':
@@ -1914,12 +2059,14 @@ class MINIATUREVOXELER_OT_generate_color_skin(Operator):
 
     @classmethod
     def poll(cls, context):
-        obj = context.active_object
-        return obj is not None and obj.type == 'MESH'
+        return has_blocks_object(context)
 
     def execute(self, context):
         settings = context.scene.miniature_voxeler_settings
-        body_obj = context.active_object
+        body_obj = get_blocks_object(settings)
+        if body_obj is None:
+            self.report({'ERROR'}, "Run Step 2 Block Remesh first so the _Blocks object exists.")
+            return {'CANCELLED'}
 
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
@@ -2056,11 +2203,6 @@ class MINIATUREVOXELER_PT_panel(Panel):
     bl_region_type = 'UI'
     bl_category = "Miniature Voxeler"
 
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return obj is not None and obj.type == 'MESH'
-
     def draw(self, context):
         layout = self.layout
         settings = context.scene.miniature_voxeler_settings
@@ -2070,7 +2212,17 @@ class MINIATUREVOXELER_PT_panel(Panel):
         header.label(text=ADDON_VERSION_TEXT)
 
         box = layout.box()
-        box.label(text="Block Remesh")
+        box.label(text="Setup")
+        col = box.column(align=True)
+        col.prop(settings, "building_object")
+        col.prop(settings, "platform_object")
+
+        box = layout.box()
+        box.label(text="Step 1: Apply All Transforms")
+        box.operator("object.miniature_voxeler_apply_all_transforms", icon='OBJECT_DATA')
+
+        box = layout.box()
+        box.label(text="Step 2: Block Remesh")
         col = box.column(align=True)
         col.prop(settings, "octree_depth")
         col.prop(settings, "scale")
@@ -2078,16 +2230,19 @@ class MINIATUREVOXELER_PT_panel(Panel):
         col.operator("object.miniature_voxeler_block_remesh", icon='MOD_REMESH')
 
         box = layout.box()
-        box.label(text="Texture Transfer")
+        box.label(text="Step 3: Smart UV")
+        box.operator("object.miniature_voxeler_smart_uv_project", icon='UV')
+
+        box = layout.box()
+        box.label(text="Step 4: Transfer Texture")
         col = box.column(align=True)
         col.prop(settings, "texture_source_name")
         col.prop(settings, "texture_size")
         col.prop(settings, "texture_margin")
-        box.operator("object.miniature_voxeler_smart_uv_project", icon='UV')
         box.operator("object.miniature_voxeler_transfer_texture", icon='TEXTURE')
 
         box = layout.box()
-        box.label(text="Lego Color")
+        box.label(text="Step 5: Lego Color")
         col = box.column(align=True)
         col.prop(settings, "lego_color_count")
         col.prop(settings, "lego_color_sample_mode")
@@ -2095,7 +2250,7 @@ class MINIATUREVOXELER_PT_panel(Panel):
         box.operator("object.miniature_voxeler_lego_color", icon='MATERIAL')
 
         smooth_box = box.box()
-        smooth_box.label(text="Smoothing Process")
+        smooth_box.label(text="Step 6: Smooth Lego Color")
         smooth_col = smooth_box.column(align=True)
         smooth_col.prop(settings, "lego_smooth_weight")
         smooth_col.prop(settings, "lego_smooth_passes")
@@ -2103,7 +2258,7 @@ class MINIATUREVOXELER_PT_panel(Panel):
         smooth_box.operator("object.miniature_voxeler_smooth_lego_color", icon='MOD_SMOOTH')
 
         palette_box = box.box()
-        palette_box.label(text="Palette Slots")
+        palette_box.label(text="Step 7: Paint Palette Slots")
         palette_box.prop(settings, "lego_paint_brush_size")
         palette_col = palette_box.column(align=True)
         active_painter = MINIATUREVOXELER_OT_paint_lego_slot._active_painter
@@ -2131,7 +2286,7 @@ class MINIATUREVOXELER_PT_panel(Panel):
         palette_box.label(text="Brush: left-drag paint, F resize, I then click picks")
 
         box = layout.box()
-        box.label(text="Lego Skin")
+        box.label(text="Step 8: Generate Lego Skin")
         col = box.column(align=True)
         col.prop(settings, "color_skin_base_slot")
         col.prop(settings, "outer_skin_mm")
@@ -2156,6 +2311,7 @@ class MINIATUREVOXELER_PT_panel(Panel):
 
 classes = (
     MINIATUREVOXELER_PG_settings,
+    MINIATUREVOXELER_OT_apply_all_transforms,
     MINIATUREVOXELER_OT_block_remesh,
     MINIATUREVOXELER_OT_smart_uv_project,
     MINIATUREVOXELER_OT_transfer_texture,
