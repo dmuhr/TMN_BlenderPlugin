@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Miniature Voxeler",
     "author": "OpenAI",
-    "version": (2, 1, 7),
+    "version": (2, 1, 19),
     "blender": (5, 0, 1),
     "location": "3D View > Sidebar > Miniature Voxeler",
     "description": "Block remesh, transfer texture, create Lego-color face materials, and generate Lego skin meshes for miniature voxel workflows",
@@ -12,7 +12,7 @@ import bpy
 import bmesh
 import gpu
 from gpu_extras.batch import batch_for_shader
-from math import cos, hypot, pi, radians, sin
+from math import atan2, cos, hypot, pi, radians, sin
 from bpy_extras import view3d_utils
 from mathutils import Vector
 from bpy.types import Operator, Panel, PropertyGroup
@@ -26,7 +26,7 @@ from bpy.props import (
     EnumProperty,
 )
 
-ADDON_VERSION_TEXT = "v.2.1.7"
+ADDON_VERSION_TEXT = "v.2.1.19"
 
 
 def srgb_channel_to_linear(value):
@@ -633,7 +633,7 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
 
     platform_wall_extrude_height: FloatProperty(
         name="Foot Gap",
-        description="Base upward gap used to generate the platform walls and foot from the selected top edge loop",
+        description="Base upward gap used to generate the platform cutter and foot from the selected top edge loop",
         default=0.0008,
         min=0.0,
         precision=6,
@@ -641,8 +641,8 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
     )
 
     platform_walls_thickness: FloatProperty(
-        name="Walls Thickness",
-        description="Solidify thickness for _Platform_Walls",
+        name="Foot Cutter Thickness",
+        description="2D thickness used to build _Foot_Cutter",
         default=0.005,
         min=0.0,
         precision=6,
@@ -650,15 +650,31 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
     )
 
     platform_walls_offset: FloatProperty(
-        name="Walls Offset",
-        description="Solidify offset for _Platform_Walls",
+        name="Foot Cutter Offset",
+        description="2D offset used to build _Foot_Cutter",
         default=0.8,
+        precision=3,
+    )
+
+    platform_building_cutter_thickness: FloatProperty(
+        name="Building Cutter Thickness",
+        description="2D thickness used to build _Building_Cutter",
+        default=0.010,
+        min=0.0,
+        precision=6,
+        unit='LENGTH',
+    )
+
+    platform_building_cutter_offset: FloatProperty(
+        name="Building Cutter Offset",
+        description="2D offset used to build _Building_Cutter",
+        default=0.0,
         precision=3,
     )
 
     platform_foot_thickness: FloatProperty(
         name="Foot Thickness",
-        description="Solidify thickness for _foot",
+        description="2D thickness used to build _foot",
         default=0.003,
         min=0.0,
         precision=6,
@@ -667,18 +683,19 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
 
     platform_foot_offset: FloatProperty(
         name="Foot Offset",
-        description="Solidify offset for _foot",
+        description="2D offset used to build _foot",
         default=-1.0,
         precision=3,
     )
 
-    platform_foot_boolean_extra_offset: FloatProperty(
-        name="Foot Bool Extra",
-        description="Extra offset added to the wall copy used only for the _foot boolean cutter",
-        default=0.01,
-        precision=3,
+    platform_foot_clearance: FloatProperty(
+        name="Foot Clearance",
+        description="Small XY expansion applied to _foot after its boolean is applied, so it does not collide with the building",
+        default=0.001,
+        min=0.0,
+        precision=6,
+        unit='LENGTH',
     )
-
 
 # ------------------------------------------------------------
 # Helpers
@@ -707,6 +724,14 @@ def get_root_name(obj_name):
         return obj_name.split("_Lego_Skin_Slot_")[0]
     if obj_name.endswith("_Lego_Base"):
         return obj_name[:-10]
+    if obj_name.endswith("_Foot_Cutter"):
+        return obj_name[:-12]
+    if obj_name.endswith("_Building_Cutter"):
+        return obj_name[:-16]
+    if "_Cutter_" in obj_name:
+        return obj_name.split("_Cutter_")[0]
+    if obj_name.endswith("_Cutter"):
+        return obj_name[:-7]
     if "_Color_Skin_Slot_" in obj_name:
         return obj_name.split("_Color_Skin_Slot_")[0]
     if obj_name.endswith("_Color_Base"):
@@ -742,7 +767,11 @@ def get_platform_copy_name(platform_name):
 
 
 def get_platform_walls_name(platform_name):
-    return f"{platform_name}_Platform_Walls"
+    return f"{platform_name}_Foot_Cutter"
+
+
+def get_platform_building_cutter_name(platform_name):
+    return f"{platform_name}_Building_Cutter"
 
 
 def get_platform_foot_name(root_name):
@@ -750,7 +779,19 @@ def get_platform_foot_name(root_name):
 
 
 def get_platform_walls_copy_name(platform_name):
-    return f"{platform_name}_Platform_Walls_Copy"
+    return f"{platform_name}_Foot_Cutter_Copy"
+
+
+def get_platform_walls_bool_name(platform_name):
+    return f"{platform_name}_Foot_Cutter_Bool"
+
+
+def get_platform_walls_copy_bool_name(platform_name):
+    return f"{platform_name}_Foot_Cutter_Copy_Bool"
+
+
+def get_platform_walls_2d_name(platform_name):
+    return f"{platform_name}_Foot_Cutter_2D"
 
 
 def set_metadata(obj, root_name, source_name):
@@ -838,6 +879,16 @@ def get_platform_walls_object(settings):
     return obj
 
 
+def get_platform_building_cutter_object(settings):
+    platform_obj = get_platform_object(settings)
+    if platform_obj is None:
+        return None
+    obj = bpy.data.objects.get(get_platform_building_cutter_name(platform_obj.name))
+    if obj is None or obj.type != 'MESH':
+        return None
+    return obj
+
+
 def get_platform_foot_object(settings):
     building_obj = get_building_object(settings)
     if building_obj is None:
@@ -858,6 +909,36 @@ def get_platform_walls_copy_object(settings):
     return obj
 
 
+def get_platform_walls_bool_object(settings):
+    platform_obj = get_platform_object(settings)
+    if platform_obj is None:
+        return None
+    obj = bpy.data.objects.get(get_platform_walls_bool_name(platform_obj.name))
+    if obj is None or obj.type != 'MESH':
+        return None
+    return obj
+
+
+def get_platform_walls_copy_bool_object(settings):
+    platform_obj = get_platform_object(settings)
+    if platform_obj is None:
+        return None
+    obj = bpy.data.objects.get(get_platform_walls_copy_bool_name(platform_obj.name))
+    if obj is None or obj.type != 'MESH':
+        return None
+    return obj
+
+
+def get_platform_walls_2d_object(settings):
+    platform_obj = get_platform_object(settings)
+    if platform_obj is None:
+        return None
+    obj = bpy.data.objects.get(get_platform_walls_2d_name(platform_obj.name))
+    if obj is None or obj.type != 'MESH':
+        return None
+    return obj
+
+
 def has_platform_copy_object(context):
     settings = getattr(context.scene, "miniature_voxeler_settings", None)
     if settings is None:
@@ -870,6 +951,13 @@ def has_platform_walls_object(context):
     if settings is None:
         return False
     return get_platform_walls_object(settings) is not None
+
+
+def has_platform_building_cutter_object(context):
+    settings = getattr(context.scene, "miniature_voxeler_settings", None)
+    if settings is None:
+        return False
+    return get_platform_building_cutter_object(settings) is not None
 
 
 def get_color_base_object(settings):
@@ -909,6 +997,19 @@ def ensure_boolean_modifier(target_obj, cutter_obj, modifier_name, operation='DI
     return mod
 
 
+def apply_boolean_modifiers_with_prefix(context, targets, prefix):
+    applied_count = 0
+    for target in targets:
+        if target is None or target.name not in bpy.data.objects:
+            continue
+        set_active_object(context, target)
+        for mod in list(target.modifiers):
+            if mod.type == 'BOOLEAN' and mod.name.startswith(prefix):
+                bpy.ops.object.modifier_apply(modifier=mod.name)
+                applied_count += 1
+    return applied_count
+
+
 def ensure_solidify_modifier(obj, modifier_name, thickness, offset):
     mod = obj.modifiers.get(modifier_name)
     if mod is None or mod.type != 'SOLIDIFY':
@@ -923,6 +1024,547 @@ def ensure_solidify_modifier(obj, modifier_name, thickness, offset):
     if hasattr(mod, "nonmanifold_thickness_mode"):
         mod.nonmanifold_thickness_mode = 'CONSTRAINTS'
     return mod
+
+
+def group_vertices_by_z(bm, decimals=6):
+    groups = {}
+    for vert in bm.verts:
+        groups.setdefault(round(float(vert.co.z), decimals), []).append(vert)
+    return groups
+
+
+def ordered_loop_from_edges(loop_verts, loop_edges):
+    if not loop_verts or not loop_edges:
+        return []
+
+    vert_ids = {vert.index for vert in loop_verts}
+    adjacency = {vert.index: [] for vert in loop_verts}
+    for edge in loop_edges:
+        a, b = edge.verts
+        if a.index in vert_ids and b.index in vert_ids:
+            adjacency[a.index].append(b.index)
+            adjacency[b.index].append(a.index)
+
+    start = loop_verts[0].index
+    ordered = [start]
+    prev = None
+    current = start
+    safety = len(loop_verts) + 4
+    while safety > 0:
+        candidates = [idx for idx in adjacency[current] if idx != prev]
+        if not candidates:
+            break
+        next_idx = candidates[0]
+        if next_idx == start:
+            break
+        if next_idx in ordered:
+            break
+        ordered.append(next_idx)
+        prev = current
+        current = next_idx
+        safety -= 1
+
+    return ordered
+
+
+def polygon_signed_area_xy(coords):
+    area = 0.0
+    for index in range(len(coords)):
+        x1, y1 = coords[index]
+        x2, y2 = coords[(index + 1) % len(coords)]
+        area += (x1 * y2) - (x2 * y1)
+    return area * 0.5
+
+
+def reverse_loop_order_preserve_start(ordered):
+    if len(ordered) <= 2:
+        return ordered[:]
+    return [ordered[0]] + list(reversed(ordered[1:]))
+
+
+def align_loop_order_to_master(loop_verts, ordered, master_coords_xy):
+    if len(ordered) != len(master_coords_xy):
+        return ordered
+
+    vert_map = {vert.index: vert for vert in loop_verts}
+    coords_xy = [(vert_map[index].co.x, vert_map[index].co.y) for index in ordered]
+    if polygon_signed_area_xy(coords_xy) * polygon_signed_area_xy(master_coords_xy) < 0.0:
+        ordered = reverse_loop_order_preserve_start(ordered)
+        coords_xy = [(vert_map[index].co.x, vert_map[index].co.y) for index in ordered]
+
+    best_shift = 0
+    best_score = None
+    count = len(ordered)
+    for shift in range(count):
+        score = 0.0
+        for index in range(count):
+            x1, y1 = coords_xy[(index + shift) % count]
+            x2, y2 = master_coords_xy[index]
+            dx = x1 - x2
+            dy = y1 - y2
+            score += (dx * dx) + (dy * dy)
+        if best_score is None or score < best_score:
+            best_score = score
+            best_shift = shift
+
+    return [ordered[(index + best_shift) % count] for index in range(count)]
+
+
+def compute_loop_offset_directions(loop_verts, ordered_indices, miter_limit=1.5):
+    if len(ordered_indices) < 3:
+        return {}
+
+    vert_map = {vert.index: vert for vert in loop_verts}
+    coords_xy = [(vert_map[index].co.x, vert_map[index].co.y) for index in ordered_indices]
+    area = polygon_signed_area_xy(coords_xy)
+    clockwise = area < 0.0
+
+    directions = {}
+    for index, vert_index in enumerate(ordered_indices):
+        prev_vert = vert_map[ordered_indices[(index - 1) % len(ordered_indices)]]
+        curr_vert = vert_map[vert_index]
+        next_vert = vert_map[ordered_indices[(index + 1) % len(ordered_indices)]]
+
+        prev_edge = Vector((curr_vert.co.x - prev_vert.co.x, curr_vert.co.y - prev_vert.co.y))
+        next_edge = Vector((next_vert.co.x - curr_vert.co.x, next_vert.co.y - curr_vert.co.y))
+        if prev_edge.length <= 1e-9 or next_edge.length <= 1e-9:
+            continue
+
+        prev_edge.normalize()
+        next_edge.normalize()
+
+        if clockwise:
+            prev_normal = Vector((-prev_edge.y, prev_edge.x))
+            next_normal = Vector((-next_edge.y, next_edge.x))
+        else:
+            prev_normal = Vector((prev_edge.y, -prev_edge.x))
+            next_normal = Vector((next_edge.y, -next_edge.x))
+
+        bisector = prev_normal + next_normal
+        if bisector.length <= 1e-9:
+            bisector = next_normal.copy()
+        else:
+            bisector.normalize()
+
+        dot_value = max(0.25, bisector.dot(next_normal))
+        directions[curr_vert.index] = (bisector, min(max(1.0, miter_limit), 1.0 / dot_value))
+
+    return directions
+
+
+def get_boundary_loop_orders(bm):
+    boundary_edges = [edge for edge in bm.edges if edge.is_boundary]
+    if not boundary_edges:
+        return []
+
+    edge_set = set(boundary_edges)
+    loops = []
+    while edge_set:
+        seed = edge_set.pop()
+        stack = [seed]
+        component_edges = [seed]
+        component_verts = set(seed.verts)
+        while stack:
+            edge = stack.pop()
+            for vert in edge.verts:
+                for linked_edge in vert.link_edges:
+                    if linked_edge in edge_set:
+                        edge_set.remove(linked_edge)
+                        stack.append(linked_edge)
+                        component_edges.append(linked_edge)
+                        component_verts.update(linked_edge.verts)
+
+        ordered = ordered_loop_from_edges(list(component_verts), component_edges)
+        if len(ordered) >= 3:
+            loops.append((list(component_verts), ordered))
+    return loops
+
+
+def get_master_boundary_loop(bm):
+    loops = get_boundary_loop_orders(bm)
+    if not loops:
+        return None, None
+
+    def loop_score(item):
+        loop_verts, ordered = item
+        vert_map = {vert.index: vert for vert in loop_verts}
+        avg_z = sum(vert_map[index].co.z for index in ordered) / len(ordered)
+        return avg_z, len(ordered)
+
+    return max(loops, key=loop_score)
+
+
+def compute_xy_offset_data(bm, miter_limit=1.5):
+    master_loop_verts, master_ordered = get_master_boundary_loop(bm)
+    if not master_ordered:
+        return {vert.index: (Vector((1.0, 0.0)), 1.0) for vert in bm.verts}
+
+    master_vert_map = {vert.index: vert for vert in master_loop_verts}
+    master_directions = compute_loop_offset_directions(master_loop_verts, master_ordered, miter_limit)
+
+    master_samples = []
+    for vert_index in master_ordered:
+        vert = master_vert_map[vert_index]
+        master_samples.append((
+            vert.co.x,
+            vert.co.y,
+            master_directions.get(vert_index, (Vector((1.0, 0.0)), 1.0)),
+        ))
+
+    offset_data = {}
+    for vert in bm.verts:
+        best_sample = None
+        best_distance = None
+        for sample_x, sample_y, sample_data in master_samples:
+            dx = vert.co.x - sample_x
+            dy = vert.co.y - sample_y
+            distance = (dx * dx) + (dy * dy)
+            if best_distance is None or distance < best_distance:
+                best_distance = distance
+                best_sample = sample_data
+        offset_data[vert.index] = best_sample or (Vector((1.0, 0.0)), 1.0)
+    return offset_data
+
+
+def cleanup_boolean_mesh(context, obj, triangulate=False):
+    set_active_object(context, obj)
+    if context.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_mode(type='VERT')
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.mesh.remove_doubles(
+        threshold=meters_to_scene_units(context, 0.00001),
+        use_unselected=False,
+        use_sharp_edge_from_normals=False,
+    )
+    bpy.ops.mesh.dissolve_degenerate(threshold=meters_to_scene_units(context, 0.00001))
+    bpy.ops.mesh.delete_loose()
+    bpy.ops.mesh.normals_make_consistent(inside=False)
+    if triangulate:
+        bpy.ops.mesh.select_all(action='SELECT')
+        bpy.ops.mesh.quads_convert_to_tris()
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+
+def segments_cross_xy(a1, a2, b1, b2, epsilon=1e-14):
+    def orient(p1, p2, p3):
+        return ((p2.x - p1.x) * (p3.y - p1.y)) - ((p2.y - p1.y) * (p3.x - p1.x))
+
+    return (
+        orient(a1, a2, b1) * orient(a1, a2, b2) < -epsilon and
+        orient(b1, b2, a1) * orient(b1, b2, a2) < -epsilon
+    )
+
+
+def segment_intersection_xy(a1, a2, b1, b2):
+    denominator = ((a1.x - a2.x) * (b1.y - b2.y)) - ((a1.y - a2.y) * (b1.x - b2.x))
+    if abs(denominator) <= 1e-14:
+        return None
+
+    a_cross = (a1.x * a2.y) - (a1.y * a2.x)
+    b_cross = (b1.x * b2.y) - (b1.y * b2.x)
+    x = ((a_cross * (b1.x - b2.x)) - ((a1.x - a2.x) * b_cross)) / denominator
+    y = ((a_cross * (b1.y - b2.y)) - ((a1.y - a2.y) * b_cross)) / denominator
+    return Vector((x, y))
+
+
+def edge_length_xy(mesh, edge):
+    v1 = mesh.vertices[edge.vertices[0]].co
+    v2 = mesh.vertices[edge.vertices[1]].co
+    return hypot(v2.x - v1.x, v2.y - v1.y)
+
+
+def count_crossed_quads_xy(mesh):
+    crossed = 0
+    for polygon in mesh.polygons:
+        if len(polygon.vertices) != 4:
+            continue
+        coords = [mesh.vertices[index].co for index in polygon.vertices]
+        if (
+            segments_cross_xy(coords[0], coords[1], coords[2], coords[3]) or
+            segments_cross_xy(coords[1], coords[2], coords[3], coords[0])
+        ):
+            crossed += 1
+    return crossed
+
+
+def count_projected_self_intersections_xy(mesh, limit=1000):
+    intersections = 0
+    edges = [
+        edge for edge in mesh.edges
+        if edge_length_xy(mesh, edge) > 1e-8
+    ]
+    for index, edge_a in enumerate(edges):
+        a1 = mesh.vertices[edge_a.vertices[0]].co
+        a2 = mesh.vertices[edge_a.vertices[1]].co
+        for edge_b in edges[index + 1:]:
+            if set(edge_a.vertices) & set(edge_b.vertices):
+                continue
+            b1 = mesh.vertices[edge_b.vertices[0]].co
+            b2 = mesh.vertices[edge_b.vertices[1]].co
+            if segments_cross_xy(a1, a2, b1, b2):
+                intersections += 1
+                if intersections >= limit:
+                    return intersections
+    return intersections
+
+
+def sorted_quad_vertices_xy(mesh, vertex_indices):
+    coords = [mesh.vertices[index].co for index in vertex_indices]
+    center_x = sum(coord.x for coord in coords) / len(coords)
+    center_y = sum(coord.y for coord in coords) / len(coords)
+    return sorted(
+        vertex_indices,
+        key=lambda index: atan2(mesh.vertices[index].co.y - center_y, mesh.vertices[index].co.x - center_x),
+    )
+
+
+def same_xy(coord, xy, epsilon=1e-9):
+    return abs(coord.x - xy[0]) <= epsilon and abs(coord.y - xy[1]) <= epsilon
+
+
+def repair_projected_self_intersections_xy(mesh):
+    edges = [
+        edge for edge in mesh.edges
+        if edge_length_xy(mesh, edge) > 1e-8
+    ]
+    move_targets = []
+
+    for index, edge_a in enumerate(edges):
+        a1 = mesh.vertices[edge_a.vertices[0]].co
+        a2 = mesh.vertices[edge_a.vertices[1]].co
+        length_a = edge_length_xy(mesh, edge_a)
+        for edge_b in edges[index + 1:]:
+            if set(edge_a.vertices) & set(edge_b.vertices):
+                continue
+            b1 = mesh.vertices[edge_b.vertices[0]].co
+            b2 = mesh.vertices[edge_b.vertices[1]].co
+            if not segments_cross_xy(a1, a2, b1, b2):
+                continue
+
+            length_b = edge_length_xy(mesh, edge_b)
+            if length_a <= 1e-8 or length_b <= 1e-8:
+                continue
+            if min(length_a, length_b) > max(length_a, length_b) * 0.75:
+                continue
+
+            intersection = segment_intersection_xy(a1, a2, b1, b2)
+            if intersection is None:
+                continue
+
+            short_edge = edge_a if length_a < length_b else edge_b
+            for vertex_index in short_edge.vertices:
+                coord = mesh.vertices[vertex_index].co
+                move_targets.append(((coord.x, coord.y), (intersection.x, intersection.y)))
+
+    if not move_targets:
+        return 0
+
+    unique_targets = {}
+    for source_xy, target_xy in move_targets:
+        key = (round(source_xy[0], 9), round(source_xy[1], 9))
+        unique_targets[key] = target_xy
+
+    moved = 0
+    for vertex in mesh.vertices:
+        for source_key, target_xy in unique_targets.items():
+            if same_xy(vertex.co, source_key):
+                vertex.co.x = target_xy[0]
+                vertex.co.y = target_xy[1]
+                moved += 1
+                break
+
+    if moved:
+        mesh.update()
+    return len(unique_targets)
+
+
+def mesh_xy_key(coord, decimals=6):
+    return (round(coord.x, decimals), round(coord.y, decimals))
+
+
+def repair_sharp_join_columns_xy(mesh):
+    xy_to_vertices = {}
+    for vertex in mesh.vertices:
+        xy_to_vertices.setdefault(mesh_xy_key(vertex.co), []).append(vertex.index)
+
+    adjacency = {key: set() for key in xy_to_vertices}
+    for edge in mesh.edges:
+        key_a = mesh_xy_key(mesh.vertices[edge.vertices[0]].co)
+        key_b = mesh_xy_key(mesh.vertices[edge.vertices[1]].co)
+        if key_a == key_b:
+            continue
+        adjacency.setdefault(key_a, set()).add(key_b)
+        adjacency.setdefault(key_b, set()).add(key_a)
+
+    repairs = []
+    for center_key, neighbors in adjacency.items():
+        if len(neighbors) != 4:
+            continue
+
+        neighbor_list = list(neighbors)
+        closest_pair = None
+        closest_distance = None
+        for index, key_a in enumerate(neighbor_list):
+            for key_b in neighbor_list[index + 1:]:
+                distance = hypot(key_b[0] - key_a[0], key_b[1] - key_a[1])
+                if closest_distance is None or distance < closest_distance:
+                    closest_distance = distance
+                    closest_pair = (key_a, key_b)
+
+        if closest_pair is None or closest_distance is None or closest_distance > 0.0025:
+            continue
+
+        other_keys = [key for key in neighbor_list if key not in closest_pair]
+        if len(other_keys) != 2:
+            continue
+
+        center = Vector(center_key)
+        side_a = Vector(closest_pair[0])
+        side_b = Vector(closest_pair[1])
+        far_a = Vector(other_keys[0])
+        far_b = Vector(other_keys[1])
+        rail = far_b - far_a
+        if rail.length <= 1e-9:
+            continue
+
+        t = max(0.0, min(1.0, (center - far_a).dot(rail) / rail.dot(rail)))
+        projected_center = far_a + (rail * t)
+        shift = (projected_center - center) * 0.6
+
+        bridge = (side_a + side_b) * 0.5
+        bridge.y += shift.y
+        cleaned_center = center + shift
+
+        repairs.append((closest_pair, center_key, bridge, cleaned_center))
+
+    if not repairs:
+        return 0
+
+    repaired_keys = set()
+    for side_keys, center_key, bridge, cleaned_center in repairs:
+        for vertex in mesh.vertices:
+            key = mesh_xy_key(vertex.co)
+            if key in side_keys:
+                vertex.co.x = bridge.x
+                vertex.co.y = bridge.y
+                repaired_keys.add(key)
+            elif key == center_key:
+                vertex.co.x = cleaned_center.x
+                vertex.co.y = cleaned_center.y
+                repaired_keys.add(key)
+
+    mesh.update()
+    return len(repairs)
+
+
+def repair_crossed_quads_xy(mesh):
+    repaired = 0
+    vertices = [vertex.co.copy() for vertex in mesh.vertices]
+    faces = []
+    material_indices = []
+
+    for polygon in mesh.polygons:
+        vertex_indices = list(polygon.vertices)
+        if len(vertex_indices) == 4:
+            coords = [mesh.vertices[index].co for index in vertex_indices]
+            if (
+                segments_cross_xy(coords[0], coords[1], coords[2], coords[3]) or
+                segments_cross_xy(coords[1], coords[2], coords[3], coords[0])
+            ):
+                vertex_indices = sorted_quad_vertices_xy(mesh, vertex_indices)
+                repaired += 1
+        faces.append(vertex_indices)
+        material_indices.append(polygon.material_index)
+
+    if repaired == 0:
+        return 0
+
+    mesh.clear_geometry()
+    mesh.from_pydata([tuple(vertex) for vertex in vertices], [], faces)
+    mesh.update(calc_edges=True)
+    for polygon, material_index in zip(mesh.polygons, material_indices):
+        polygon.material_index = material_index
+    return repaired
+
+
+def build_thickened_surface_mesh(
+    context,
+    source_obj,
+    target_obj,
+    thickness,
+    offset,
+    triangulate=False,
+    miter_limit=1.5,
+    repair_sharp_joins=True,
+):
+    source_bm = bmesh.new()
+    source_bm.from_mesh(source_obj.data)
+    source_bm.verts.ensure_lookup_table()
+    source_bm.edges.ensure_lookup_table()
+    source_bm.faces.ensure_lookup_table()
+
+    if not source_bm.faces:
+        source_bm.free()
+        return 0, 0, 0, 0
+
+    offset_data = compute_xy_offset_data(source_bm, miter_limit)
+    inward_distance = max(0.0, thickness * (1.0 - offset) * 0.5)
+    outward_distance = max(0.0, thickness * (1.0 + offset) * 0.5)
+
+    build_bm = bmesh.new()
+    inner_map = {}
+    outer_map = {}
+    for vert in source_bm.verts:
+        direction, scale = offset_data.get(vert.index, (Vector((1.0, 0.0)), 1.0))
+        inner_co = vert.co.copy()
+        outer_co = vert.co.copy()
+        inner_co.x -= direction.x * inward_distance * scale
+        inner_co.y -= direction.y * inward_distance * scale
+        outer_co.x += direction.x * outward_distance * scale
+        outer_co.y += direction.y * outward_distance * scale
+        inner_map[vert.index] = build_bm.verts.new(inner_co)
+        outer_map[vert.index] = build_bm.verts.new(outer_co)
+
+    build_bm.verts.ensure_lookup_table()
+    for face in source_bm.faces:
+        try:
+            build_bm.faces.new([inner_map[vert.index] for vert in face.verts])
+        except ValueError:
+            pass
+        try:
+            build_bm.faces.new(list(reversed([outer_map[vert.index] for vert in face.verts])))
+        except ValueError:
+            pass
+
+    for edge in source_bm.edges:
+        if not edge.is_boundary:
+            continue
+        v1, v2 = edge.verts
+        quad = [
+            inner_map[v1.index],
+            inner_map[v2.index],
+            outer_map[v2.index],
+            outer_map[v1.index],
+        ]
+        try:
+            build_bm.faces.new(quad)
+        except ValueError:
+            pass
+
+    build_bm.normal_update()
+    build_bm.to_mesh(target_obj.data)
+    target_obj.data.update()
+    build_bm.free()
+    source_bm.free()
+
+    repaired_columns = repair_sharp_join_columns_xy(target_obj.data) if repair_sharp_joins else 0
+    repaired_intersections = repair_projected_self_intersections_xy(target_obj.data) if repair_sharp_joins else 0
+    repaired_quads = repair_crossed_quads_xy(target_obj.data) if repair_sharp_joins else 0
+    cleanup_boolean_mesh(context, target_obj, triangulate=triangulate)
+    remaining_intersections = count_projected_self_intersections_xy(target_obj.data)
+    return len(inner_map), repaired_columns + repaired_intersections + repaired_quads, count_crossed_quads_xy(target_obj.data), remaining_intersections
 
 
 def show_info_popup(context, title, lines, icon='INFO'):
@@ -967,7 +1609,7 @@ def select_connected_edge_loops_from_seeds(obj):
     bm.edges.ensure_lookup_table()
 
     seed_edges = [edge for edge in bm.edges if edge.select]
-    if len(seed_edges) != 2:
+    if not seed_edges:
         return 0
 
     selected_count = 0
@@ -979,6 +1621,44 @@ def select_connected_edge_loops_from_seeds(obj):
     bm.select_flush_mode()
     bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
     return selected_count
+
+
+def get_selected_edge_groups(obj):
+    bm = bmesh.from_edit_mesh(obj.data)
+    bm.edges.ensure_lookup_table()
+
+    selected_edges = [edge for edge in bm.edges if edge.select]
+    visited = set()
+    groups = []
+    for edge in selected_edges:
+        if edge.index in visited:
+            continue
+        stack = [edge]
+        group = []
+        while stack:
+            current = stack.pop()
+            if current.index in visited or not current.select:
+                continue
+            visited.add(current.index)
+            group.append(current)
+            for vert in current.verts:
+                for linked_edge in vert.link_edges:
+                    if linked_edge.select and linked_edge.index not in visited:
+                        stack.append(linked_edge)
+        if group:
+            groups.append(group)
+    return groups
+
+
+def selected_edge_group_z_values(edge_group):
+    values = []
+    seen = set()
+    for edge in edge_group:
+        for vert in edge.verts:
+            if vert.index not in seen:
+                seen.add(vert.index)
+                values.append(vert.co.z)
+    return values
 
 
 def extrude_foot_gap_edges_on_z(obj, top_edge_indices, top_up_distance, lower_edge_indices=None, lower_down_distance=0.0):
@@ -1115,6 +1795,178 @@ def rebuild_tube_from_top_loop(obj, top_edge_indices, target_bottom_z, top_up_di
     obj.data.update()
     bm.free()
     return tube_side_count, top_up_count, bottom_down_count
+
+
+def set_mesh_to_ring(obj, coords):
+    verts = [tuple(coord) for coord in coords]
+    edges = [(index, (index + 1) % len(verts)) for index in range(len(verts))]
+    obj.data.clear_geometry()
+    obj.data.from_pydata(verts, edges, [])
+    obj.data.update()
+
+
+def store_platform_ring_data(obj, top_coords, lower_z):
+    obj["mv_platform_top_ring"] = [value for coord in top_coords for value in coord]
+    obj["mv_platform_lower_z"] = float(lower_z)
+
+
+def store_platform_lower_height(obj, lower_z):
+    obj["mv_platform_lower_z"] = float(lower_z)
+
+
+def get_stored_platform_lower_height(obj):
+    lower_z = obj.get("mv_platform_lower_z", None)
+    if lower_z is None:
+        return None
+    return float(lower_z)
+
+
+def get_stored_platform_ring_data(obj):
+    flat = obj.get("mv_platform_top_ring", [])
+    lower_z = get_stored_platform_lower_height(obj)
+    if lower_z is None or len(flat) < 9 or len(flat) % 3 != 0:
+        return [], None
+    coords = [
+        (float(flat[index]), float(flat[index + 1]), float(flat[index + 2]))
+        for index in range(0, len(flat), 3)
+    ]
+    return coords, float(lower_z)
+
+
+def polygon_area_from_coords_xy(coords):
+    area = 0.0
+    for index, coord in enumerate(coords):
+        next_coord = coords[(index + 1) % len(coords)]
+        area += (coord[0] * next_coord[1]) - (next_coord[0] * coord[1])
+    return area * 0.5
+
+
+def offset_ring_coords(coords, thickness, offset):
+    if len(coords) < 3:
+        return [], []
+
+    clockwise = polygon_area_from_coords_xy(coords) < 0.0
+    inward_distance = max(0.0, thickness * (1.0 - offset) * 0.5)
+    outward_distance = max(0.0, thickness * (1.0 + offset) * 0.5)
+    inner = []
+    outer = []
+
+    for index, coord in enumerate(coords):
+        prev_coord = coords[(index - 1) % len(coords)]
+        next_coord = coords[(index + 1) % len(coords)]
+        prev_edge = Vector((coord[0] - prev_coord[0], coord[1] - prev_coord[1]))
+        next_edge = Vector((next_coord[0] - coord[0], next_coord[1] - coord[1]))
+        if prev_edge.length <= 1e-9 or next_edge.length <= 1e-9:
+            direction = Vector((1.0, 0.0))
+            scale = 1.0
+        else:
+            prev_edge.normalize()
+            next_edge.normalize()
+            if clockwise:
+                prev_normal = Vector((-prev_edge.y, prev_edge.x))
+                next_normal = Vector((-next_edge.y, next_edge.x))
+            else:
+                prev_normal = Vector((prev_edge.y, -prev_edge.x))
+                next_normal = Vector((next_edge.y, -next_edge.x))
+            direction = prev_normal + next_normal
+            if direction.length <= 1e-9:
+                direction = next_normal.copy()
+            else:
+                direction.normalize()
+            scale = min(2.0, 1.0 / max(0.5, direction.dot(next_normal)))
+
+        inner.append((coord[0] - direction.x * inward_distance * scale, coord[1] - direction.y * inward_distance * scale, coord[2]))
+        outer.append((coord[0] + direction.x * outward_distance * scale, coord[1] + direction.y * outward_distance * scale, coord[2]))
+
+    return inner, outer
+
+
+def build_2d_thick_ring_mesh(obj, source_coords, thickness, offset):
+    inner, outer = offset_ring_coords(source_coords, thickness, offset)
+    if len(inner) < 3 or len(outer) < 3:
+        return 0
+
+    verts = inner + outer
+    count = len(inner)
+    faces = []
+    for index in range(count):
+        faces.append((
+            index,
+            (index + 1) % count,
+            count + ((index + 1) % count),
+            count + index,
+        ))
+
+    obj.data.clear_geometry()
+    obj.data.from_pydata(verts, [], faces)
+    obj.data.update()
+    return count
+
+
+def expand_mesh_xy_from_center(obj, distance):
+    if obj is None or obj.type != 'MESH' or distance <= 0.0 or not obj.data.vertices:
+        return 0
+
+    center = Vector((0.0, 0.0))
+    for vertex in obj.data.vertices:
+        center.x += vertex.co.x
+        center.y += vertex.co.y
+    center /= len(obj.data.vertices)
+
+    moved_count = 0
+    for vertex in obj.data.vertices:
+        direction = Vector((vertex.co.x - center.x, vertex.co.y - center.y))
+        if direction.length <= 1e-9:
+            continue
+        direction.normalize()
+        vertex.co.x += direction.x * distance
+        vertex.co.y += direction.y * distance
+        moved_count += 1
+
+    obj.data.update()
+    return moved_count
+
+
+def extrude_cleaned_2d_mesh_to_3d(obj, top_offset, lower_z, bottom_down=0.0):
+    source_verts = [vertex.co.copy() for vertex in obj.data.vertices]
+    source_faces = [list(poly.vertices) for poly in obj.data.polygons]
+    if not source_verts or not source_faces:
+        return 0
+
+    bottom_z = lower_z - max(0.0, bottom_down)
+    top_verts = [Vector((vert.x, vert.y, vert.z + top_offset)) for vert in source_verts]
+    bottom_verts = [Vector((vert.x, vert.y, bottom_z)) for vert in source_verts]
+    verts = [tuple(vert) for vert in top_verts + bottom_verts]
+    vert_count = len(source_verts)
+    faces = []
+
+    for face in source_faces:
+        faces.append(tuple(face))
+        faces.append(tuple(reversed([index + vert_count for index in face])))
+
+    edge_use = {}
+    for face in source_faces:
+        for edge in zip(face, face[1:] + face[:1]):
+            key = tuple(sorted(edge))
+            edge_use[key] = edge_use.get(key, 0) + 1
+
+    for a, b in edge_use:
+        if edge_use[(a, b)] == 1:
+            faces.append((a, b, b + vert_count, a + vert_count))
+
+    obj.data.clear_geometry()
+    obj.data.from_pydata(verts, [], faces)
+    obj.data.update()
+    return len(faces)
+
+
+def enter_edit_vertex_wireframe(context, obj):
+    set_active_object(context, obj)
+    if context.mode != 'EDIT_MESH':
+        bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_mode(type='VERT')
+    bpy.ops.mesh.select_all(action='SELECT')
+    obj.display_type = 'WIRE'
 
 
 def get_enabled_color_skin_slots(settings):
@@ -2580,6 +3432,7 @@ class MINIATUREVOXELER_OT_generate_color_skin(Operator):
         for slot_source in slot_sources.values():
             remove_object_if_exists(slot_source)
 
+        body_obj.hide_set(True)
         set_active_object(context, base_obj)
 
         msg = "Processed: " + ", ".join(processed)
@@ -2587,7 +3440,7 @@ class MINIATUREVOXELER_OT_generate_color_skin(Operator):
             msg += " | Skipped: " + ", ".join(skipped)
         if settings.make_boolean_base:
             msg += " | Boolean-Difference base. applied"
-        msg += " | Clean slot sources deleted"
+        msg += " | Clean slot sources deleted | _Blocks hidden"
 
         self.report({'INFO'}, msg)
         return {'FINISHED'}
@@ -2637,12 +3490,12 @@ class MINIATUREVOXELER_OT_prepare_platform_copy(Operator):
 
 
 # ------------------------------------------------------------
-# Operator 10: Select and Separate Platform Walls
+# Operator 10: Select and Separate Platform Cutter
 # ------------------------------------------------------------
 
 class MINIATUREVOXELER_OT_prepare_platform_walls_selection(Operator):
     bl_idname = "object.mv_platform_walls_select"
-    bl_label = "Select Platform Walls"
+    bl_label = "Select Platform Cutter"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -2661,13 +3514,13 @@ class MINIATUREVOXELER_OT_prepare_platform_walls_selection(Operator):
             bpy.ops.object.mode_set(mode='EDIT')
         bpy.ops.mesh.select_mode(type='FACE')
         bpy.ops.mesh.select_all(action='DESELECT')
-        self.report({'INFO'}, f"Select the wall faces on {obj.name}, then run Separate Selected Walls.")
+        self.report({'INFO'}, f"Select the cutter faces on {obj.name}, then run Separate Selected Cutter.")
         return {'FINISHED'}
 
 
 class MINIATUREVOXELER_OT_separate_platform_walls(Operator):
     bl_idname = "object.mv_platform_walls_separate"
-    bl_label = "Separate Selected Walls"
+    bl_label = "Separate Selected Cutter"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -2709,7 +3562,7 @@ class MINIATUREVOXELER_OT_separate_platform_walls(Operator):
 
         new_obj = find_new_object(pre_names, platform_copy, context)
         if new_obj is None:
-            self.report({'ERROR'}, "Could not identify the separated platform walls object.")
+            self.report({'ERROR'}, "Could not identify the separated cutter object.")
             return {'CANCELLED'}
 
         new_obj.name = get_platform_walls_name(platform_name)
@@ -2722,7 +3575,7 @@ class MINIATUREVOXELER_OT_separate_platform_walls(Operator):
 
 
 # ------------------------------------------------------------
-# Operator 11: Clean Platform Walls
+# Operator 11: Clean Platform Cutter
 # ------------------------------------------------------------
 
 class MINIATUREVOXELER_OT_merge_platform_walls_by_distance(Operator):
@@ -2732,13 +3585,24 @@ class MINIATUREVOXELER_OT_merge_platform_walls_by_distance(Operator):
 
     @classmethod
     def poll(cls, context):
-        return has_platform_walls_object(context)
+        settings = getattr(context.scene, "miniature_voxeler_settings", None)
+        if settings is None:
+            return False
+        return (
+            get_platform_walls_object(settings) is not None or
+            get_platform_foot_object(settings) is not None or
+            get_platform_building_cutter_object(settings) is not None
+        )
 
     def execute(self, context):
         settings = context.scene.miniature_voxeler_settings
-        obj = get_platform_walls_object(settings)
+        walls_obj = get_platform_walls_object(settings)
+        foot_obj = get_platform_foot_object(settings)
+        building_cutter_obj = get_platform_building_cutter_object(settings)
+        active_obj = context.edit_object if context.mode == 'EDIT_MESH' else context.object
+        obj = active_obj if active_obj in {walls_obj, foot_obj, building_cutter_obj} else walls_obj
         if obj is None:
-            self.report({'ERROR'}, "Run Step 10 first so the platform walls exist.")
+            self.report({'ERROR'}, "Create a 2D wall or foot mesh first.")
             return {'CANCELLED'}
 
         if context.mode != 'EDIT_MESH':
@@ -2761,9 +3625,13 @@ class MINIATUREVOXELER_OT_merge_platform_walls_by_distance(Operator):
         return {'FINISHED'}
 
 
-class MINIATUREVOXELER_OT_select_platform_walls_non_manifold(Operator):
-    bl_idname = "object.mv_platform_walls_nonmanifold"
-    bl_label = "Select Non-Manifold"
+# ------------------------------------------------------------
+# Operator 12: Store Platform Rings
+# ------------------------------------------------------------
+
+class MINIATUREVOXELER_OT_store_platform_lower_ring(Operator):
+    bl_idname = "object.mv_platform_lower_ring"
+    bl_label = "Store Lower Ring"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -2774,41 +3642,7 @@ class MINIATUREVOXELER_OT_select_platform_walls_non_manifold(Operator):
         settings = context.scene.miniature_voxeler_settings
         obj = get_platform_walls_object(settings)
         if obj is None:
-            self.report({'ERROR'}, "Run Step 10 first so the platform walls exist.")
-            return {'CANCELLED'}
-
-        if context.mode != 'EDIT_MESH':
-            set_active_object(context, obj)
-            bpy.ops.object.mode_set(mode='EDIT')
-        elif context.edit_object != obj:
-            bpy.ops.object.mode_set(mode='OBJECT')
-            set_active_object(context, obj)
-            bpy.ops.object.mode_set(mode='EDIT')
-        bpy.ops.mesh.select_mode(type='EDGE')
-        bpy.ops.mesh.select_all(action='DESELECT')
-        bpy.ops.mesh.select_non_manifold()
-        self.report({'INFO'}, f"Non-manifold edges selected on {obj.name} for inspection.")
-        return {'FINISHED'}
-
-
-# ------------------------------------------------------------
-# Operator 12: Enlarge Platform Walls
-# ------------------------------------------------------------
-
-class MINIATUREVOXELER_OT_prepare_platform_wall_loop_selection(Operator):
-    bl_idname = "object.mv_platform_wall_loop"
-    bl_label = "Select Top Edge Loop"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    @classmethod
-    def poll(cls, context):
-        return has_platform_walls_object(context)
-
-    def execute(self, context):
-        settings = context.scene.miniature_voxeler_settings
-        obj = get_platform_walls_object(settings)
-        if obj is None:
-            self.report({'ERROR'}, "Run Step 10 first so the platform walls exist.")
+            self.report({'ERROR'}, "Run Step 10 first so the cutter exists.")
             return {'CANCELLED'}
 
         if context.mode != 'EDIT_MESH':
@@ -2823,160 +3657,42 @@ class MINIATUREVOXELER_OT_prepare_platform_wall_loop_selection(Operator):
         bm = bmesh.from_edit_mesh(obj.data)
         bm.edges.ensure_lookup_table()
         selected_edges = [edge for edge in bm.edges if edge.select]
-        if len(selected_edges) != 2:
+        if not selected_edges:
             show_info_popup(
                 context,
-                "Select 2 Seed Edges",
+                "Select Lower Ring",
                 [
-                    f"On {obj.name}, select exactly one top rim edge and one lower rim edge.",
-                    "The top loop defines the shape. The lower loop is used only for height.",
-                    "The tube floor uses the lowest point from the lower loop.",
-                    "Then press Select Wall Loops again to expand both loops.",
+                    f"On {obj.name}, select the lower wall ring.",
+                    "You can select one lower edge as a seed or the full lower loop.",
+                    "The plugin stores the lowest Z point as the floor height.",
                 ],
                 icon='EDGESEL',
             )
-            self.report({'WARNING'}, "Select exactly one top rim edge and one lower rim edge first, then run Select Wall Loops again.")
+            self.report({'WARNING'}, "Select the lower ring first.")
             return {'CANCELLED'}
 
-        selected_count = select_connected_edge_loops_from_seeds(obj)
-        if selected_count <= 2:
-            self.report({'WARNING'}, f"Could not expand both edge loops on {obj.name}.")
+        if len(selected_edges) == 1:
+            select_connected_edge_loops_from_seeds(obj)
+
+        loop_groups = get_selected_edge_groups(obj)
+        if len(loop_groups) != 1:
+            self.report({'ERROR'}, "Store Lower Ring expects exactly one selected lower loop.")
             return {'CANCELLED'}
 
-        self.report({'INFO'}, f"Selected {selected_count} connected loop edge(s) on {obj.name}.")
+        lower_values = selected_edge_group_z_values(loop_groups[0])
+        if not lower_values:
+            self.report({'ERROR'}, "Could not read the lower ring height.")
+            return {'CANCELLED'}
+
+        lower_z = min(lower_values)
+        store_platform_lower_height(obj, lower_z)
+        self.report({'INFO'}, f"Stored lower ring height: {lower_z:.6f}.")
         return {'FINISHED'}
 
 
-class MINIATUREVOXELER_OT_extrude_platform_walls_up(Operator):
-    bl_idname = "object.mv_platform_walls_extrude"
-    bl_label = "Build Foot Gap"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    @classmethod
-    def poll(cls, context):
-        return has_platform_walls_object(context)
-
-    def execute(self, context):
-        settings = context.scene.miniature_voxeler_settings
-        building_obj = get_building_object(settings)
-        obj = get_platform_walls_object(settings)
-        if building_obj is None or obj is None:
-            self.report({'ERROR'}, "Run Step 10 first so the platform walls exist.")
-            return {'CANCELLED'}
-
-        if context.mode != 'EDIT_MESH':
-            set_active_object(context, obj)
-            bpy.ops.object.mode_set(mode='EDIT')
-        elif context.edit_object != obj:
-            bpy.ops.object.mode_set(mode='OBJECT')
-            set_active_object(context, obj)
-            bpy.ops.object.mode_set(mode='EDIT')
-
-        bm = bmesh.from_edit_mesh(obj.data)
-        bm.edges.ensure_lookup_table()
-        selected_edges = [edge for edge in bm.edges if edge.select]
-        if len(selected_edges) < 2:
-            self.report({'ERROR'}, "Select the top loop and lower loop before building the foot gap.")
-            return {'CANCELLED'}
-
-        visited = set()
-        loop_groups = []
-        for edge in selected_edges:
-            if edge.index in visited:
-                continue
-            stack = [edge]
-            group = []
-            while stack:
-                current = stack.pop()
-                if current.index in visited or not current.select:
-                    continue
-                visited.add(current.index)
-                group.append(current)
-                for vert in current.verts:
-                    for linked_edge in vert.link_edges:
-                        if linked_edge.select and linked_edge.index not in visited:
-                            stack.append(linked_edge)
-            if group:
-                loop_groups.append(group)
-
-        if len(loop_groups) != 2:
-            self.report({'ERROR'}, "Build Foot Gap expects exactly two selected edge loops: one top and one lower.")
-            return {'CANCELLED'}
-
-        def get_loop_z_values(edge_group):
-            values = []
-            seen = set()
-            for edge in edge_group:
-                for vert in edge.verts:
-                    if vert.index not in seen:
-                        seen.add(vert.index)
-                        values.append(vert.co.z)
-            return values
-
-        def average_loop_z(edge_group):
-            values = get_loop_z_values(edge_group)
-            return sum(values) / max(1, len(values))
-
-        loop_groups.sort(key=average_loop_z, reverse=True)
-        top_edge_indices = [edge.index for edge in loop_groups[0]]
-        lower_target_z = min(get_loop_z_values(loop_groups[1]))
-
-        bpy.ops.object.mode_set(mode='OBJECT')
-
-        root_name = get_root_name(building_obj.name)
-        existing_foot = get_platform_foot_object(settings)
-        if existing_foot is not None:
-            remove_object_if_exists(existing_foot)
-        existing_walls_copy = get_platform_walls_copy_object(settings)
-        if existing_walls_copy is not None:
-            remove_object_if_exists(existing_walls_copy)
-
-        foot_obj = duplicate_object(context, obj, get_platform_foot_name(root_name))
-        set_metadata(foot_obj, root_name, obj.name)
-        for mod in list(foot_obj.modifiers):
-            foot_obj.modifiers.remove(mod)
-
-        wall_up = settings.platform_wall_extrude_height
-        wall_down = meters_to_scene_units(context, 0.01)
-        foot_up = max(0.0, settings.platform_wall_extrude_height - meters_to_scene_units(context, 0.0002))
-
-        wall_tube_count, wall_top_count, wall_lower_count = rebuild_tube_from_top_loop(
-            obj,
-            top_edge_indices,
-            lower_target_z,
-            wall_up,
-            wall_down,
-        )
-        foot_tube_count, foot_top_count, _ = rebuild_tube_from_top_loop(
-            foot_obj,
-            top_edge_indices,
-            lower_target_z,
-            foot_up,
-            0.0,
-        )
-
-        wall_thickness = meters_to_scene_units(context, settings.platform_walls_thickness)
-        foot_thickness = meters_to_scene_units(context, settings.platform_foot_thickness)
-        ensure_solidify_modifier(obj, "PlatformWallsSolidify", wall_thickness, settings.platform_walls_offset)
-        ensure_solidify_modifier(foot_obj, "PlatformFootSolidify", foot_thickness, settings.platform_foot_offset)
-        set_active_object(context, obj)
-
-        self.report(
-            {'INFO'},
-            f"Built foot gap: {obj.name} up {wall_up:.6f} / down 0.010000, {foot_obj.name} up {foot_up:.6f}. "
-            f"Tube counts: walls {wall_tube_count}, foot {foot_tube_count}. "
-            f"Loop sizes: walls top {wall_top_count}, walls lower {wall_lower_count}, foot top {foot_top_count}."
-        )
-        return {'FINISHED'}
-
-
-# ------------------------------------------------------------
-# Operator 14: Add Platform Boolean Modifiers
-# ------------------------------------------------------------
-
-class MINIATUREVOXELER_OT_add_platform_boolean_modifiers(Operator):
-    bl_idname = "object.mv_platform_booleans_add"
-    bl_label = "Add Platform Booleans"
+class MINIATUREVOXELER_OT_prepare_platform_wall_loop_selection(Operator):
+    bl_idname = "object.mv_platform_wall_loop"
+    bl_label = "Store Upper Ring"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -2984,63 +3700,318 @@ class MINIATUREVOXELER_OT_add_platform_boolean_modifiers(Operator):
         settings = getattr(context.scene, "miniature_voxeler_settings", None)
         if settings is None:
             return False
-        return (
-            get_platform_walls_object(settings) is not None and
-            get_platform_foot_object(settings) is not None and
-            get_color_base_object(settings) is not None
-        )
+        obj = get_platform_walls_object(settings)
+        return obj is not None and get_stored_platform_lower_height(obj) is not None
 
     def execute(self, context):
         settings = context.scene.miniature_voxeler_settings
-        walls_obj = get_platform_walls_object(settings)
-        walls_copy_obj = get_platform_walls_copy_object(settings)
-        foot_obj = get_platform_foot_object(settings)
-        base_obj = get_color_base_object(settings)
-        skin_objects = get_color_skin_objects(settings)
-        if walls_obj is None or foot_obj is None or base_obj is None:
-            self.report({'ERROR'}, "Run Steps 8 and 12 first so the Lego base, walls, and foot all exist.")
+        obj = get_platform_walls_object(settings)
+        if obj is None:
+            self.report({'ERROR'}, "Run Step 10 first so the cutter exists.")
+            return {'CANCELLED'}
+        lower_z = get_stored_platform_lower_height(obj)
+        if lower_z is None:
+            self.report({'ERROR'}, "Run Store Lower Ring first.")
+            return {'CANCELLED'}
+
+        if context.mode != 'EDIT_MESH':
+            set_active_object(context, obj)
+            bpy.ops.object.mode_set(mode='EDIT')
+        elif context.edit_object != obj:
+            bpy.ops.object.mode_set(mode='OBJECT')
+            set_active_object(context, obj)
+            bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_mode(type='EDGE')
+
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.edges.ensure_lookup_table()
+        selected_edges = [edge for edge in bm.edges if edge.select]
+        if not selected_edges:
+            show_info_popup(
+                context,
+                "Select Upper Ring",
+                [
+                    f"On {obj.name}, select the upper wall ring.",
+                    "You can select one upper edge as a seed or the full upper loop.",
+                    "This deletes all wall geometry except that stored upper ring.",
+                ],
+                icon='EDGESEL',
+            )
+            self.report({'WARNING'}, "Select the upper ring first.")
+            return {'CANCELLED'}
+
+        if len(selected_edges) == 1:
+            select_connected_edge_loops_from_seeds(obj)
+
+        loop_groups = get_selected_edge_groups(obj)
+        if len(loop_groups) != 1:
+            self.report({'ERROR'}, "Store Upper Ring expects exactly one selected upper loop.")
+            return {'CANCELLED'}
+
+        top_edge_indices = [edge.index for edge in loop_groups[0]]
+
+        bpy.ops.object.mode_set(mode='OBJECT')
+        top_coords = get_ordered_loop_coords(obj, top_edge_indices)
+        if len(top_coords) < 3:
+            self.report({'ERROR'}, "Could not read the upper ring.")
+            return {'CANCELLED'}
+
+        store_platform_ring_data(obj, top_coords, lower_z)
+        set_mesh_to_ring(obj, top_coords)
+        enter_edit_vertex_wireframe(context, obj)
+
+        self.report({'INFO'}, f"Stored upper ring ({len(top_coords)} vertices) and deleted all other wall geometry.")
+        return {'FINISHED'}
+
+
+class MINIATUREVOXELER_OT_extrude_platform_walls_up(Operator):
+    bl_idname = "object.mv_platform_walls_extrude"
+    bl_label = "Build 2D _Foot_Cutter"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return has_platform_walls_object(context)
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        obj = get_platform_walls_object(settings)
+        if obj is None:
+            self.report({'ERROR'}, "Store the upper ring first.")
+            return {'CANCELLED'}
+
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        coords, lower_z = get_stored_platform_ring_data(obj)
+        if len(coords) < 3 or lower_z is None:
+            self.report({'ERROR'}, "Run Store Upper Ring first.")
+            return {'CANCELLED'}
+
+        count = build_2d_thick_ring_mesh(
+            obj,
+            coords,
+            meters_to_scene_units(context, settings.platform_walls_thickness),
+            settings.platform_walls_offset,
+        )
+        obj["mv_platform_stage"] = "foot_cutter_2d"
+        enter_edit_vertex_wireframe(context, obj)
+
+        self.report({'INFO'}, f"Built editable 2D _Foot_Cutter from {count} ring vertices. Clean it manually before 3D.")
+        return {'FINISHED'}
+
+
+class MINIATUREVOXELER_OT_build_platform_building_cutter_2d(Operator):
+    bl_idname = "object.mv_platform_building_cutter_2d_build"
+    bl_label = "Build 2D _Building_Cutter"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return has_platform_walls_object(context)
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        foot_cutter_obj = get_platform_walls_object(settings)
+        platform_obj = get_platform_object(settings)
+        building_obj = get_building_object(settings)
+        if foot_cutter_obj is None or platform_obj is None or building_obj is None:
+            self.report({'ERROR'}, "Store the upper ring first.")
+            return {'CANCELLED'}
+
+        coords, lower_z = get_stored_platform_ring_data(foot_cutter_obj)
+        if len(coords) < 3 or lower_z is None:
+            self.report({'ERROR'}, "Run Store Upper Ring first.")
             return {'CANCELLED'}
 
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
 
-        if walls_copy_obj is not None:
-            remove_object_if_exists(walls_copy_obj)
+        existing_cutter = get_platform_building_cutter_object(settings)
+        if existing_cutter is not None:
+            remove_object_if_exists(existing_cutter)
 
-        platform_obj = get_platform_object(settings)
-        platform_name = platform_obj.name if platform_obj is not None else walls_obj.name
-        walls_copy_obj = duplicate_object(context, walls_obj, get_platform_walls_copy_name(platform_name))
-        for mod in list(walls_copy_obj.modifiers):
-            if mod.type == 'SOLIDIFY' and mod.name == "PlatformWallsSolidify":
-                mod.offset = settings.platform_walls_offset + settings.platform_foot_boolean_extra_offset
-        walls_copy_obj.hide_set(True)
-
-        targets = [base_obj] + skin_objects
-        for obj in targets:
-            ensure_boolean_modifier(
-                obj,
-                walls_obj,
-                f"PlatformWallsCut_{walls_obj.name}",
-                operation='DIFFERENCE',
-                solver='EXACT',
-            )
-
-        ensure_boolean_modifier(
-            foot_obj,
-            walls_copy_obj,
-            f"PlatformWallsCut_{walls_copy_obj.name}",
-            operation='DIFFERENCE',
-            solver='EXACT',
+        cutter_obj = duplicate_object(context, foot_cutter_obj, get_platform_building_cutter_name(platform_obj.name))
+        set_metadata(cutter_obj, get_root_name(building_obj.name), foot_cutter_obj.name)
+        store_platform_ring_data(cutter_obj, coords, lower_z)
+        count = build_2d_thick_ring_mesh(
+            cutter_obj,
+            coords,
+            meters_to_scene_units(context, settings.platform_building_cutter_thickness),
+            settings.platform_building_cutter_offset,
         )
-        set_active_object(context, base_obj)
+        cutter_obj["mv_platform_stage"] = "building_cutter_2d"
+        enter_edit_vertex_wireframe(context, cutter_obj)
 
-        self.report({'INFO'}, f"Added non-applied Exact boolean modifiers to {len(targets)} Lego object(s) and {foot_obj.name} using {walls_copy_obj.name}.")
+        self.report({'INFO'}, f"Built editable 2D _Building_Cutter from {count} ring vertices. Clean it manually before 3D.")
         return {'FINISHED'}
 
 
-class MINIATUREVOXELER_OT_apply_platform_booleans(Operator):
-    bl_idname = "object.mv_platform_booleans_apply"
-    bl_label = "Apply Platform Booleans"
+# ------------------------------------------------------------
+# Operator 13: Build Thick Meshes
+# ------------------------------------------------------------
+
+class MINIATUREVOXELER_OT_build_platform_walls_2d_preview(Operator):
+    bl_idname = "object.mv_platform_foot_2d_build"
+    bl_label = "Build 2D _foot"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return has_platform_walls_object(context)
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        walls_obj = get_platform_walls_object(settings)
+        building_obj = get_building_object(settings)
+        if walls_obj is None or building_obj is None:
+            self.report({'ERROR'}, "Store the upper ring first.")
+            return {'CANCELLED'}
+
+        coords, lower_z = get_stored_platform_ring_data(walls_obj)
+        if len(coords) < 3 or lower_z is None:
+            self.report({'ERROR'}, "Run Store Upper Ring first.")
+            return {'CANCELLED'}
+
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        existing_foot = get_platform_foot_object(settings)
+        if existing_foot is not None:
+            remove_object_if_exists(existing_foot)
+
+        foot_obj = duplicate_object(context, walls_obj, get_platform_foot_name(get_root_name(building_obj.name)))
+        set_metadata(foot_obj, get_root_name(building_obj.name), walls_obj.name)
+        store_platform_ring_data(foot_obj, coords, lower_z)
+        count = build_2d_thick_ring_mesh(
+            foot_obj,
+            coords,
+            meters_to_scene_units(context, settings.platform_foot_thickness),
+            settings.platform_foot_offset,
+        )
+        foot_obj["mv_platform_stage"] = "foot_2d"
+        enter_edit_vertex_wireframe(context, foot_obj)
+
+        self.report({'INFO'}, f"Built editable 2D _foot from {count} ring vertices. Clean it manually before 3D.")
+        return {'FINISHED'}
+
+
+class MINIATUREVOXELER_OT_build_platform_walls_mesh(Operator):
+    bl_idname = "object.mv_platform_walls_build_mesh"
+    bl_label = "Build _Foot_Cutter"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return has_platform_walls_object(context)
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        walls_obj = get_platform_walls_object(settings)
+        if walls_obj is None:
+            self.report({'ERROR'}, "Build and clean 2D _Foot_Cutter first.")
+            return {'CANCELLED'}
+
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        _, lower_z = get_stored_platform_ring_data(walls_obj)
+        if lower_z is None:
+            self.report({'ERROR'}, "Stored lower height is missing. Run Store Upper Ring again.")
+            return {'CANCELLED'}
+
+        face_count = extrude_cleaned_2d_mesh_to_3d(
+            walls_obj,
+            settings.platform_wall_extrude_height,
+            lower_z,
+            bottom_down=meters_to_scene_units(context, 0.01),
+        )
+        walls_obj["mv_platform_stage"] = "foot_cutter_3d"
+        set_active_object(context, walls_obj)
+        self.report({'INFO'}, f"Built 3D {walls_obj.name} from the cleaned 2D mesh with {face_count} face(s).")
+        return {'FINISHED'}
+
+
+class MINIATUREVOXELER_OT_build_platform_building_cutter_mesh(Operator):
+    bl_idname = "object.mv_platform_building_cutter_build_mesh"
+    bl_label = "Build _Building_Cutter"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return has_platform_building_cutter_object(context)
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        cutter_obj = get_platform_building_cutter_object(settings)
+        if cutter_obj is None:
+            self.report({'ERROR'}, "Build and clean 2D _Building_Cutter first.")
+            return {'CANCELLED'}
+
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        _, lower_z = get_stored_platform_ring_data(cutter_obj)
+        if lower_z is None:
+            self.report({'ERROR'}, "Stored lower height is missing. Build 2D _Building_Cutter again.")
+            return {'CANCELLED'}
+
+        face_count = extrude_cleaned_2d_mesh_to_3d(
+            cutter_obj,
+            settings.platform_wall_extrude_height,
+            lower_z,
+            bottom_down=meters_to_scene_units(context, 0.01),
+        )
+        cutter_obj["mv_platform_stage"] = "building_cutter_3d"
+        set_active_object(context, cutter_obj)
+        self.report({'INFO'}, f"Built 3D {cutter_obj.name} from the cleaned 2D mesh with {face_count} face(s).")
+        return {'FINISHED'}
+
+
+class MINIATUREVOXELER_OT_build_platform_foot_mesh(Operator):
+    bl_idname = "object.mv_platform_foot_build_mesh"
+    bl_label = "Build _foot"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        settings = getattr(context.scene, "miniature_voxeler_settings", None)
+        return settings is not None and get_platform_foot_object(settings) is not None
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        foot_obj = get_platform_foot_object(settings)
+        if foot_obj is None:
+            self.report({'ERROR'}, "Build and clean 2D _foot first.")
+            return {'CANCELLED'}
+
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        _, lower_z = get_stored_platform_ring_data(foot_obj)
+        if lower_z is None:
+            self.report({'ERROR'}, "Stored lower height is missing. Build 2D _foot again.")
+            return {'CANCELLED'}
+
+        foot_up = max(0.0, settings.platform_wall_extrude_height - meters_to_scene_units(context, 0.0002))
+        face_count = extrude_cleaned_2d_mesh_to_3d(
+            foot_obj,
+            foot_up,
+            lower_z,
+            bottom_down=0.0,
+        )
+        foot_obj["mv_platform_stage"] = "foot_3d"
+        set_active_object(context, foot_obj)
+        self.report({'INFO'}, f"Built 3D {foot_obj.name} from the cleaned 2D mesh with {face_count} face(s).")
+        return {'FINISHED'}
+
+
+# ------------------------------------------------------------
+# Operator 15: Platform Boolean Modifiers
+# ------------------------------------------------------------
+
+class MINIATUREVOXELER_OT_add_platform_foot_boolean(Operator):
+    bl_idname = "object.mv_platform_foot_boolean_add"
+    bl_label = "Add Foot Boolean"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -3056,14 +4027,95 @@ class MINIATUREVOXELER_OT_apply_platform_booleans(Operator):
     def execute(self, context):
         settings = context.scene.miniature_voxeler_settings
         walls_obj = get_platform_walls_object(settings)
-        walls_copy_obj = get_platform_walls_copy_object(settings)
         foot_obj = get_platform_foot_object(settings)
+        if walls_obj is None or foot_obj is None:
+            self.report({'ERROR'}, "Build 3D _Foot_Cutter and _foot first.")
+            return {'CANCELLED'}
+
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        ensure_boolean_modifier(
+            foot_obj,
+            walls_obj,
+            f"PlatformFootCut_{walls_obj.name}",
+            operation='DIFFERENCE',
+            solver='EXACT',
+        )
+        set_active_object(context, foot_obj)
+
+        show_info_popup(
+            context,
+            "Double Check Foot Boolean",
+            [
+                "Inspect _foot now before continuing.",
+                "If the cut looks wrong, fix the 2D _foot or _Foot_Cutter before applying the foot boolean.",
+            ],
+            icon='ERROR',
+        )
+        self.report({'INFO'}, f"Added non-applied Exact foot boolean using {walls_obj.name}. Double check it before continuing.")
+        return {'FINISHED'}
+
+
+class MINIATUREVOXELER_OT_add_platform_building_booleans(Operator):
+    bl_idname = "object.mv_platform_building_booleans_add"
+    bl_label = "Add Building Booleans"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        settings = getattr(context.scene, "miniature_voxeler_settings", None)
+        if settings is None:
+            return False
+        return (
+            get_platform_building_cutter_object(settings) is not None and
+            get_color_base_object(settings) is not None
+        )
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        building_cutter_obj = get_platform_building_cutter_object(settings)
         base_obj = get_color_base_object(settings)
         skin_objects = get_color_skin_objects(settings)
-
-        if walls_obj is None or foot_obj is None:
-            self.report({'ERROR'}, "Run Steps 12 and 13 first so the wall cutters and foot exist.")
+        if building_cutter_obj is None or base_obj is None:
+            self.report({'ERROR'}, "Build 3D _Building_Cutter and Lego base first.")
             return {'CANCELLED'}
+
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        targets = [base_obj] + skin_objects
+        for obj in targets:
+            ensure_boolean_modifier(
+                obj,
+                building_cutter_obj,
+                f"PlatformBuildingCut_{building_cutter_obj.name}",
+                operation='DIFFERENCE',
+                solver='EXACT',
+            )
+        set_active_object(context, base_obj)
+
+        self.report({'INFO'}, f"Added non-applied Exact building booleans to {len(targets)} object(s) using {building_cutter_obj.name}.")
+        return {'FINISHED'}
+
+
+class MINIATUREVOXELER_OT_apply_platform_building_booleans(Operator):
+    bl_idname = "object.mv_platform_building_booleans_apply"
+    bl_label = "Apply Building Booleans"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        settings = getattr(context.scene, "miniature_voxeler_settings", None)
+        if settings is None:
+            return False
+        return get_color_base_object(settings) is not None
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        base_obj = get_color_base_object(settings)
+        building_cutter_obj = get_platform_building_cutter_object(settings)
+        skin_objects = get_color_skin_objects(settings)
 
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
@@ -3072,27 +4124,58 @@ class MINIATUREVOXELER_OT_apply_platform_booleans(Operator):
         if base_obj is not None:
             targets.append(base_obj)
         targets.extend(skin_objects)
-        targets.append(foot_obj)
 
-        applied_count = 0
-        for target in targets:
-            if target is None or target.name not in bpy.data.objects:
-                continue
-            set_active_object(context, target)
-            for mod in list(target.modifiers):
-                if mod.type == 'BOOLEAN' and mod.name.startswith("PlatformWallsCut_"):
-                    bpy.ops.object.modifier_apply(modifier=mod.name)
-                    applied_count += 1
-
-        remove_object_if_exists(walls_obj)
-        remove_object_if_exists(walls_copy_obj)
+        applied_count = apply_boolean_modifiers_with_prefix(context, targets, "PlatformBuildingCut_")
 
         if base_obj is not None and base_obj.name in bpy.data.objects:
             set_active_object(context, base_obj)
-        elif foot_obj is not None and foot_obj.name in bpy.data.objects:
+
+        remove_object_if_exists(building_cutter_obj)
+
+        self.report({'INFO'}, f"Applied {applied_count} building boolean modifier(s) and deleted _Building_Cutter.")
+        return {'FINISHED'}
+
+
+class MINIATUREVOXELER_OT_apply_platform_foot_boolean(Operator):
+    bl_idname = "object.mv_platform_foot_boolean_apply"
+    bl_label = "Apply Foot Boolean"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        settings = getattr(context.scene, "miniature_voxeler_settings", None)
+        if settings is None:
+            return False
+        return get_platform_foot_object(settings) is not None
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        walls_obj = get_platform_walls_object(settings)
+        walls_copy_obj = get_platform_walls_copy_object(settings)
+        walls_copy_bool_obj = get_platform_walls_copy_bool_object(settings)
+        foot_obj = get_platform_foot_object(settings)
+
+        if foot_obj is None:
+            self.report({'ERROR'}, "Build _foot first.")
+            return {'CANCELLED'}
+
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        applied_count = apply_boolean_modifiers_with_prefix(context, [foot_obj], "PlatformFootCut_")
+        expanded_count = expand_mesh_xy_from_center(
+            foot_obj,
+            meters_to_scene_units(context, settings.platform_foot_clearance),
+        )
+
+        remove_object_if_exists(walls_obj)
+        remove_object_if_exists(walls_copy_obj)
+        remove_object_if_exists(walls_copy_bool_obj)
+
+        if foot_obj is not None and foot_obj.name in bpy.data.objects:
             set_active_object(context, foot_obj)
 
-        self.report({'INFO'}, f"Applied {applied_count} platform boolean modifier(s) and deleted the wall cutters.")
+        self.report({'INFO'}, f"Applied {applied_count} foot boolean modifier(s), expanded {expanded_count} vertices by Foot Clearance, and deleted _Foot_Cutter.")
         return {'FINISHED'}
 
 
@@ -3217,43 +4300,76 @@ class MINIATUREVOXELER_PT_panel(Panel):
         col.operator("object.miniature_voxeler_prepare_platform_copy", icon='DUPLICATE')
 
         box = layout.box()
-        box.label(text="Step 10: Separate Platform Walls")
-        box.label(text="Select wall faces on the platform copy, then separate them.")
+        box.label(text="Step 10: Separate Platform Cutter")
+        box.label(text="Select cutter faces on the platform copy, then separate them.")
         row = box.row(align=True)
         row.operator("object.mv_platform_walls_select", icon='FACESEL')
         row.operator("object.mv_platform_walls_separate", icon='MESH_CUBE')
 
         box = layout.box()
-        box.label(text="Step 11: Clean Platform Walls")
+        box.label(text="Step 11: Clean Platform Cutter")
         col = box.column(align=True)
         col.prop(settings, "platform_merge_distance")
-        row = col.row(align=True)
-        row.operator("object.mv_platform_walls_merge", icon='MESH_DATA')
-        row.operator("object.mv_platform_walls_nonmanifold", icon='EDGESEL')
-        box.label(text="Before moving to next step, make sure wall loop is clean.")
+        col.operator("object.mv_platform_walls_merge", icon='MESH_DATA')
+        box.label(text="Before moving to next step, make sure cutter loop is clean.")
 
         box = layout.box()
-        box.label(text="Step 12: Build Foot Gap")
+        box.label(text="Step 12: Store Platform Rings")
         col = box.column(align=True)
-        col.prop(settings, "platform_wall_extrude_height")
+        walls_obj = get_platform_walls_object(settings)
+        lower_z = get_stored_platform_lower_height(walls_obj) if walls_obj is not None else None
+        lower_text = f"Stored Lower Height: {lower_z:.6f}" if lower_z is not None else "Stored Lower Height: not stored"
+        col.label(text=lower_text)
+        col.operator("object.mv_platform_lower_ring", text="Store Lower Ring", icon='EDGESEL')
+        upper_row = col.row(align=True)
+        upper_row.enabled = lower_z is not None
+        upper_row.operator("object.mv_platform_wall_loop", text="Store Upper Ring", icon='EDGESEL')
+        box.label(text="First select only the lower ring and store its height.")
+        box.label(text="Then select only the upper ring; all other wall geometry is deleted.")
+
+        box = layout.box()
+        box.label(text="Step 13: _Foot_Cutter 2D Clean Up")
+        col = box.column(align=True)
         col.prop(settings, "platform_walls_thickness")
         col.prop(settings, "platform_walls_offset")
-        col.prop(settings, "platform_foot_thickness")
-        col.prop(settings, "platform_foot_offset")
-        row = col.row(align=True)
-        row.operator("object.mv_platform_wall_loop", text="Select Wall Loops", icon='EDGESEL')
-        row.operator("object.mv_platform_walls_extrude", text="Build Foot Gap", icon='MOD_SOLIDIFY')
-        box.label(text="Select 1 top rim edge and 1 lower rim edge, then expand both loops.")
-        box.label(text="Top loop defines the shape. Lower loop sets the floor from its lowest point.")
-        box.label(text="Walls go up by Foot Gap and down by 0.01 m.")
-        box.label(text="Foot goes up by Foot Gap minus 0.0002 m.")
+        col.operator("object.mv_platform_walls_extrude", text="Build 2D _Foot_Cutter", icon='MESH_GRID')
+        box.prop(settings, "platform_merge_distance")
+        box.operator("object.mv_platform_walls_merge", text="Merge Active 2D By Distance", icon='AUTOMERGE_ON')
+        box.label(text="Manually clean _Foot_Cutter in edit vertex wireframe before continuing.")
 
         box = layout.box()
-        box.label(text="Step 13: Add Platform Booleans")
-        box.prop(settings, "platform_foot_boolean_extra_offset")
-        box.label(text="Adds Exact boolean modifiers without applying them.")
-        box.operator("object.mv_platform_booleans_add", icon='MOD_BOOLEAN')
-        box.operator("object.mv_platform_booleans_apply", icon='CHECKMARK')
+        box.label(text="Step 14: _foot 2D Clean Up")
+        col = box.column(align=True)
+        col.prop(settings, "platform_wall_extrude_height")
+        col.prop(settings, "platform_foot_thickness")
+        col.prop(settings, "platform_foot_offset")
+        col.operator("object.mv_platform_foot_2d_build", text="Build 2D _foot", icon='MESH_GRID')
+        box.prop(settings, "platform_merge_distance")
+        box.operator("object.mv_platform_walls_merge", text="Merge Active 2D By Distance", icon='AUTOMERGE_ON')
+        box.label(text="Manually clean _foot separately before building 3D meshes.")
+
+        box = layout.box()
+        box.label(text="Step 15: _Building_Cutter 2D Clean Up")
+        col = box.column(align=True)
+        col.prop(settings, "platform_building_cutter_thickness")
+        col.prop(settings, "platform_building_cutter_offset")
+        col.operator("object.mv_platform_building_cutter_2d_build", text="Build 2D _Building_Cutter", icon='MESH_GRID')
+        box.prop(settings, "platform_merge_distance")
+        box.operator("object.mv_platform_walls_merge", text="Merge Active 2D By Distance", icon='AUTOMERGE_ON')
+        box.label(text="Manually clean _Building_Cutter before building 3D meshes.")
+
+        box = layout.box()
+        box.label(text="Step 16: Build 3D Meshes and Booleans")
+        row = box.row(align=True)
+        row.operator("object.mv_platform_walls_build_mesh", text="3D _Foot_Cutter", icon='MESH_CUBE')
+        row.operator("object.mv_platform_foot_build_mesh", text="3D _foot", icon='MESH_DATA')
+        box.operator("object.mv_platform_building_cutter_build_mesh", text="3D _Building_Cutter", icon='MESH_CUBE')
+        box.operator("object.mv_platform_foot_boolean_add", icon='MOD_BOOLEAN')
+        box.label(text="Warning: double check the _foot boolean before continuing.")
+        box.prop(settings, "platform_foot_clearance")
+        box.operator("object.mv_platform_foot_boolean_apply", icon='CHECKMARK')
+        box.operator("object.mv_platform_building_booleans_add", icon='MOD_BOOLEAN')
+        box.operator("object.mv_platform_building_booleans_apply", icon='CHECKMARK')
 
 # ------------------------------------------------------------
 # Register
@@ -3273,11 +4389,18 @@ classes = (
     MINIATUREVOXELER_OT_prepare_platform_walls_selection,
     MINIATUREVOXELER_OT_separate_platform_walls,
     MINIATUREVOXELER_OT_merge_platform_walls_by_distance,
-    MINIATUREVOXELER_OT_select_platform_walls_non_manifold,
+    MINIATUREVOXELER_OT_store_platform_lower_ring,
     MINIATUREVOXELER_OT_prepare_platform_wall_loop_selection,
     MINIATUREVOXELER_OT_extrude_platform_walls_up,
-    MINIATUREVOXELER_OT_add_platform_boolean_modifiers,
-    MINIATUREVOXELER_OT_apply_platform_booleans,
+    MINIATUREVOXELER_OT_build_platform_building_cutter_2d,
+    MINIATUREVOXELER_OT_build_platform_walls_2d_preview,
+    MINIATUREVOXELER_OT_build_platform_walls_mesh,
+    MINIATUREVOXELER_OT_build_platform_building_cutter_mesh,
+    MINIATUREVOXELER_OT_build_platform_foot_mesh,
+    MINIATUREVOXELER_OT_add_platform_foot_boolean,
+    MINIATUREVOXELER_OT_add_platform_building_booleans,
+    MINIATUREVOXELER_OT_apply_platform_building_booleans,
+    MINIATUREVOXELER_OT_apply_platform_foot_boolean,
     MINIATUREVOXELER_PT_panel,
 )
 
