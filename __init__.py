@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Miniature Voxeler",
     "author": "OpenAI",
-    "version": (3, 2, 0),
+    "version": (3, 3, 0),
     "blender": (5, 0, 1),
     "location": "3D View > Sidebar > Miniature Voxeler",
     "description": "Block remesh, transfer texture, create Lego-color face materials, and generate Lego skin meshes for miniature voxel workflows",
@@ -27,7 +27,7 @@ from bpy.props import (
     EnumProperty,
 )
 
-ADDON_VERSION_TEXT = "v.3.2.0"
+ADDON_VERSION_TEXT = "v.3.3.0"
 
 
 def srgb_channel_to_linear(value):
@@ -518,13 +518,17 @@ def get_platform_keepout_data(settings):
     if walls_obj is None:
         return None
 
-    coords, _ = get_stored_platform_ring_data(walls_obj)
-    if len(coords) < 3:
+    rings, _ = get_stored_platform_rings_data(walls_obj)
+    rings = [coords for coords in rings if len(coords) >= 3]
+    if not rings:
         return None
 
-    top_z = float(sum(coord[2] for coord in coords) / len(coords))
+    top_z = max(
+        float(sum(coord[2] for coord in coords) / len(coords))
+        for coords in rings
+    )
     return {
-        "polygon": coords,
+        "polygons": rings,
         "top_z": top_z,
     }
 
@@ -539,11 +543,14 @@ def cell_intersects_top_loop_keepout(cell_center, voxel_size, keepout, z_floor):
     if cell_max.z <= z_floor or cell_min.z >= keepout["top_z"]:
         return False
 
-    return polygon_intersects_rect_xy(
-        keepout["polygon"],
-        (cell_min.x, cell_min.y),
-        (cell_max.x, cell_max.y),
-    )
+    for polygon in keepout.get("polygons", []):
+        if polygon_intersects_rect_xy(
+            polygon,
+            (cell_min.x, cell_min.y),
+            (cell_max.x, cell_max.y),
+        ):
+            return True
+    return False
 
 
 def is_point_inside_evaluated_mesh(obj_eval, point_world, ray_distance):
@@ -2597,8 +2604,41 @@ def set_mesh_to_ring(obj, coords):
     obj.data.update()
 
 
+def set_mesh_to_rings(obj, rings):
+    verts = []
+    edges = []
+    for coords in rings:
+        if len(coords) < 3:
+            continue
+        start_index = len(verts)
+        verts.extend(tuple(coord) for coord in coords)
+        count = len(coords)
+        edges.extend(
+            (start_index + index, start_index + ((index + 1) % count))
+            for index in range(count)
+        )
+
+    obj.data.clear_geometry()
+    obj.data.from_pydata(verts, edges, [])
+    obj.data.update()
+
+
 def store_platform_ring_data(obj, top_coords, lower_z=None):
-    obj["mv_platform_top_ring"] = [value for coord in top_coords for value in coord]
+    store_platform_rings_data(obj, [top_coords], lower_z)
+
+
+def store_platform_rings_data(obj, rings, lower_z=None):
+    clean_rings = [
+        [(float(coord[0]), float(coord[1]), float(coord[2])) for coord in coords]
+        for coords in rings
+        if len(coords) >= 3
+    ]
+    obj["mv_platform_top_rings_json"] = json.dumps(clean_rings, separators=(",", ":"))
+    if clean_rings:
+        obj["mv_platform_top_ring"] = [value for coord in clean_rings[0] for value in coord]
+    elif "mv_platform_top_ring" in obj:
+        del obj["mv_platform_top_ring"]
+
     if lower_z is not None:
         obj["mv_platform_lower_z"] = float(lower_z)
     elif "mv_platform_lower_z" in obj:
@@ -2617,15 +2657,43 @@ def get_stored_platform_lower_height(obj):
 
 
 def get_stored_platform_ring_data(obj):
+    rings, lower_z = get_stored_platform_rings_data(obj)
+    if not rings:
+        return [], lower_z
+    return rings[0], lower_z
+
+
+def get_stored_platform_rings_data(obj):
+    raw = obj.get("mv_platform_top_rings_json", "")
     flat = obj.get("mv_platform_top_ring", [])
     lower_z = get_stored_platform_lower_height(obj)
+    if raw:
+        try:
+            values = json.loads(raw)
+        except Exception:
+            values = []
+        rings = []
+        for ring in values:
+            if len(ring) < 3:
+                continue
+            coords = []
+            for coord in ring:
+                if len(coord) != 3:
+                    coords = []
+                    break
+                coords.append((float(coord[0]), float(coord[1]), float(coord[2])))
+            if len(coords) >= 3:
+                rings.append(coords)
+        if rings:
+            return rings, lower_z
+
     if len(flat) < 9 or len(flat) % 3 != 0:
-        return [], None
+        return [], lower_z
     coords = [
         (float(flat[index]), float(flat[index + 1]), float(flat[index + 2]))
         for index in range(0, len(flat), 3)
     ]
-    return coords, lower_z
+    return [coords], lower_z
 
 
 def polygon_area_from_coords_xy(coords):
@@ -2699,6 +2767,10 @@ def build_2d_thick_ring_mesh(obj, source_coords, thickness, offset):
 
 
 def build_2d_cutter_mesh(obj, source_coords, inner_distance, outer_distance):
+    return build_2d_cutter_mesh_from_rings(obj, [source_coords], inner_distance, outer_distance)
+
+
+def append_2d_cutter_ring_geometry(verts, faces, source_coords, inner_distance, outer_distance):
     inner, outer = offset_ring_coords(source_coords, inner_distance + outer_distance, 0.0)
     if len(inner) < 3 or len(outer) < 3:
         return 0
@@ -2708,19 +2780,44 @@ def build_2d_cutter_mesh(obj, source_coords, inner_distance, outer_distance):
         _, outer = offset_ring_coords(source_coords, outer_distance * 2.0, 0.0)
 
     original = [tuple(coord) for coord in source_coords]
-    verts = inner + original + outer
+    start_index = len(verts)
+    verts.extend(inner + original + outer)
     count = len(original)
-    faces = []
 
     for index in range(count):
         next_index = (index + 1) % count
-        faces.append((index, next_index, count + next_index, count + index))
-        faces.append((count + index, count + next_index, (count * 2) + next_index, (count * 2) + index))
+        faces.append((
+            start_index + index,
+            start_index + next_index,
+            start_index + count + next_index,
+            start_index + count + index,
+        ))
+        faces.append((
+            start_index + count + index,
+            start_index + count + next_index,
+            start_index + (count * 2) + next_index,
+            start_index + (count * 2) + index,
+        ))
+    return count
+
+
+def build_2d_cutter_mesh_from_rings(obj, rings, inner_distance, outer_distance):
+    verts = []
+    faces = []
+    total_count = 0
+    for source_coords in rings:
+        total_count += append_2d_cutter_ring_geometry(
+            verts,
+            faces,
+            source_coords,
+            inner_distance,
+            outer_distance,
+        )
 
     obj.data.clear_geometry()
     obj.data.from_pydata(verts, [], faces)
     obj.data.update()
-    return count
+    return total_count
 
 
 def get_boundary_edge_loops_from_mesh(mesh):
@@ -2779,19 +2876,54 @@ def get_boundary_edge_loops_from_mesh(mesh):
 
 
 def close_2d_cutter_inner_loop(context, obj):
+    return close_2d_cutter_inner_loops(context, obj)
+
+
+def close_2d_cutter_inner_loops(context, obj):
     mesh = obj.data
     loops = get_boundary_edge_loops_from_mesh(mesh)
     if len(loops) < 2:
         return 0, 0
 
+    def loop_coords(loop):
+        return [mesh.vertices[index].co for index in loop]
+
     def loop_area(loop):
-        coords = [mesh.vertices[index].co for index in loop]
+        coords = loop_coords(loop)
         return abs(polygon_area_from_coords_xy([(coord.x, coord.y, coord.z) for coord in coords]))
 
-    inner_loop = min(loops, key=loop_area)
+    def loop_center_xy(loop):
+        coords = loop_coords(loop)
+        return (
+            sum(coord.x for coord in coords) / len(coords),
+            sum(coord.y for coord in coords) / len(coords),
+        )
+
+    loop_infos = []
+    for loop in loops:
+        coords = [mesh.vertices[index].co for index in loop]
+        loop_infos.append({
+            "loop": loop,
+            "area": abs(polygon_area_from_coords_xy([(coord.x, coord.y, coord.z) for coord in coords])),
+            "polygon": [(coord.x, coord.y, coord.z) for coord in coords],
+            "center": loop_center_xy(loop),
+        })
+
+    inner_loops = []
+    for info in loop_infos:
+        for other in loop_infos:
+            if info is other or other["area"] <= info["area"]:
+                continue
+            if point_in_polygon_xy(info["center"], other["polygon"]):
+                inner_loops.append(info["loop"])
+                break
+
+    if not inner_loops:
+        inner_loops = [min(loops, key=loop_area)]
+
     face_count_before = len(mesh.polygons)
 
-    # This is the scripted equivalent of selecting the inner loop and pressing
+    # This is the scripted equivalent of selecting inner loops and pressing
     # Alt+F with Beauty enabled in Blender's Fill operator.
     set_active_object(context, obj)
     bpy.ops.object.mode_set(mode='EDIT')
@@ -2801,7 +2933,7 @@ def close_2d_cutter_inner_loop(context, obj):
     bm = bmesh.from_edit_mesh(mesh)
     bm.verts.ensure_lookup_table()
     bm.edges.ensure_lookup_table()
-    loop_set = set(inner_loop)
+    loop_set = set(index for loop in inner_loops for index in loop)
     for vert in bm.verts:
         vert.select = vert.index in loop_set
     for edge in bm.edges:
@@ -2815,7 +2947,8 @@ def close_2d_cutter_inner_loop(context, obj):
         bpy.ops.mesh.fill()
 
     bpy.ops.object.mode_set(mode='OBJECT')
-    return len(inner_loop), max(0, len(mesh.polygons) - face_count_before)
+    closed_vertex_count = sum(len(loop) for loop in inner_loops)
+    return closed_vertex_count, max(0, len(mesh.polygons) - face_count_before)
 
 
 def extrude_mesh_down_from_faces(obj, depth):
@@ -4962,9 +5095,9 @@ class MINIATUREVOXELER_OT_prepare_platform_wall_loop_selection(Operator):
                 context,
                 "Select Upper Ring",
                 [
-                    f"On {obj.name}, select the upper wall ring.",
-                    "You can select one upper edge as a seed or the full upper loop.",
-                    "This deletes all wall geometry except that stored upper ring.",
+                    f"On {obj.name}, select the upper wall ring(s).",
+                    "You can select one upper edge per hole, or select each full upper loop.",
+                    "This deletes all wall geometry except the stored upper ring paths.",
                 ],
                 icon='EDGESEL',
             )
@@ -4975,23 +5108,28 @@ class MINIATUREVOXELER_OT_prepare_platform_wall_loop_selection(Operator):
             select_connected_edge_loops_from_seeds(obj)
 
         loop_groups = get_selected_edge_groups(obj)
-        if len(loop_groups) != 1:
-            self.report({'ERROR'}, "Store Upper Ring expects exactly one selected upper loop.")
+        if not loop_groups:
+            self.report({'ERROR'}, "Store Upper Ring needs at least one selected upper loop.")
             return {'CANCELLED'}
-
-        top_edge_indices = [edge.index for edge in loop_groups[0]]
 
         bpy.ops.object.mode_set(mode='OBJECT')
-        top_coords = get_ordered_loop_coords(obj, top_edge_indices)
-        if len(top_coords) < 3:
-            self.report({'ERROR'}, "Could not read the upper ring.")
+        rings = []
+        for loop_group in loop_groups:
+            top_edge_indices = [edge.index for edge in loop_group]
+            top_coords = get_ordered_loop_coords(obj, top_edge_indices)
+            if len(top_coords) >= 3:
+                rings.append(top_coords)
+
+        if not rings:
+            self.report({'ERROR'}, "Could not read the selected upper ring(s).")
             return {'CANCELLED'}
 
-        store_platform_ring_data(obj, top_coords)
-        set_mesh_to_ring(obj, top_coords)
+        store_platform_rings_data(obj, rings)
+        set_mesh_to_rings(obj, rings)
         enter_edit_vertex_wireframe(context, obj)
 
-        self.report({'INFO'}, f"Stored upper ring ({len(top_coords)} vertices) and deleted all other wall geometry.")
+        vertex_count = sum(len(coords) for coords in rings)
+        self.report({'INFO'}, f"Stored {len(rings)} upper ring(s) ({vertex_count} vertices) and deleted all other wall geometry.")
         return {'FINISHED'}
 
 
@@ -5013,21 +5151,22 @@ class MINIATUREVOXELER_OT_extrude_platform_walls_up(Operator):
 
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
-        coords, _ = get_stored_platform_ring_data(obj)
-        if len(coords) < 3:
+        rings, _ = get_stored_platform_rings_data(obj)
+        rings = [coords for coords in rings if len(coords) >= 3]
+        if not rings:
             self.report({'ERROR'}, "Run Store Upper Ring first.")
             return {'CANCELLED'}
 
-        count = build_2d_cutter_mesh(
+        count = build_2d_cutter_mesh_from_rings(
             obj,
-            coords,
+            rings,
             mm_to_scene_units(context, settings.platform_inner_thickness_mm),
             mm_to_scene_units(context, settings.platform_outer_thickness_mm),
         )
         obj["mv_platform_stage"] = "building_cutter_2d_open"
         enter_edit_vertex_wireframe(context, obj)
 
-        self.report({'INFO'}, f"Built editable 2D cutter from {count} ring vertices. Inspect and clean it before closing.")
+        self.report({'INFO'}, f"Built editable 2D cutter from {len(rings)} ring(s), {count} vertices total. Inspect and clean it before closing.")
         return {'FINISHED'}
 
 
