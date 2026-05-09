@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Miniature Voxeler",
     "author": "OpenAI",
-    "version": (3, 1, 21),
+    "version": (3, 2, 0),
     "blender": (5, 0, 1),
     "location": "3D View > Sidebar > Miniature Voxeler",
     "description": "Block remesh, transfer texture, create Lego-color face materials, and generate Lego skin meshes for miniature voxel workflows",
@@ -27,7 +27,7 @@ from bpy.props import (
     EnumProperty,
 )
 
-ADDON_VERSION_TEXT = "v.3.1.21"
+ADDON_VERSION_TEXT = "v.3.2.0"
 
 
 def srgb_channel_to_linear(value):
@@ -2778,49 +2778,44 @@ def get_boundary_edge_loops_from_mesh(mesh):
     return loops
 
 
-def close_2d_cutter_inner_loop(obj):
+def close_2d_cutter_inner_loop(context, obj):
     mesh = obj.data
     loops = get_boundary_edge_loops_from_mesh(mesh)
     if len(loops) < 2:
-        return 0
+        return 0, 0
 
     def loop_area(loop):
         coords = [mesh.vertices[index].co for index in loop]
         return abs(polygon_area_from_coords_xy([(coord.x, coord.y, coord.z) for coord in coords]))
 
     inner_loop = min(loops, key=loop_area)
-    center = Vector((0.0, 0.0, 0.0))
-    for index in inner_loop:
-        center += mesh.vertices[index].co
-    center /= len(inner_loop)
+    face_count_before = len(mesh.polygons)
 
-    verts = [vertex.co.copy() for vertex in mesh.vertices]
-    faces = [tuple(poly.vertices) for poly in mesh.polygons]
-    reference_normal = Vector((0.0, 0.0, 1.0))
-    if mesh.polygons:
-        reference_normal = Vector((0.0, 0.0, 0.0))
-        for poly in mesh.polygons:
-            reference_normal += poly.normal
-        if reference_normal.length <= 1e-9:
-            reference_normal = Vector((0.0, 0.0, 1.0))
-        else:
-            reference_normal.normalize()
+    # This is the scripted equivalent of selecting the inner loop and pressing
+    # Alt+F with Beauty enabled in Blender's Fill operator.
+    set_active_object(context, obj)
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_mode(type='EDGE')
+    bpy.ops.mesh.select_all(action='DESELECT')
 
-    center_index = len(verts)
-    verts.append(center)
+    bm = bmesh.from_edit_mesh(mesh)
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    loop_set = set(inner_loop)
+    for vert in bm.verts:
+        vert.select = vert.index in loop_set
+    for edge in bm.edges:
+        edge.select = edge.verts[0].index in loop_set and edge.verts[1].index in loop_set
+    bm.select_flush_mode()
+    bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
 
-    for loop_index, vertex_index in enumerate(inner_loop):
-        next_index = inner_loop[(loop_index + 1) % len(inner_loop)]
-        normal = (verts[next_index] - verts[vertex_index]).cross(verts[center_index] - verts[vertex_index])
-        if normal.dot(reference_normal) < 0.0:
-            faces.append((next_index, vertex_index, center_index))
-        else:
-            faces.append((vertex_index, next_index, center_index))
+    try:
+        bpy.ops.mesh.fill(use_beauty=True)
+    except TypeError:
+        bpy.ops.mesh.fill()
 
-    mesh.clear_geometry()
-    mesh.from_pydata([tuple(vert) for vert in verts], [], faces)
-    mesh.update()
-    return len(inner_loop)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    return len(inner_loop), max(0, len(mesh.polygons) - face_count_before)
 
 
 def extrude_mesh_down_from_faces(obj, depth):
@@ -5055,7 +5050,7 @@ class MINIATUREVOXELER_OT_build_platform_building_cutter_2d(Operator):
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
 
-        closed_count = close_2d_cutter_inner_loop(cutter_obj)
+        closed_count, triangle_count = close_2d_cutter_inner_loop(context, cutter_obj)
         if closed_count == 0:
             self.report({'ERROR'}, "Could not find the inner boundary loop to close.")
             return {'CANCELLED'}
@@ -5063,7 +5058,7 @@ class MINIATUREVOXELER_OT_build_platform_building_cutter_2d(Operator):
         cutter_obj["mv_platform_stage"] = "building_cutter_2d_closed"
         enter_edit_vertex_wireframe(context, cutter_obj)
 
-        self.report({'INFO'}, f"Closed the 2D cutter by merging {closed_count} inner-loop vertices to center. Inspect and manually fix holes or strange areas before extruding.")
+        self.report({'INFO'}, f"Closed the 2D cutter with Beauty Fill: {triangle_count} triangle(s) from {closed_count} inner-loop vertices.")
         return {'FINISHED'}
 
 
@@ -5394,9 +5389,9 @@ class MINIATUREVOXELER_PT_panel(Panel):
 
             # Step 1.8 closes the 2D cutter so it can become solid geometry.
             box = self.draw_step_box(layout, 'PLATFORM', "1.8 Close 2D Cutter")
-            box.label(text="Merges the inner loop to center.")
+            box.label(text="Fills the inner loop with Beauty Fill.")
             box.label(text="Inspect and manually fix holes or strange areas before the next step.")
-            box.operator("object.mv_platform_cutter_close_2d", text="Merge Inner Loop To Center", icon='FACESEL')
+            box.operator("object.mv_platform_cutter_close_2d", text="Beauty Fill Inner Loop", icon='FACESEL')
 
             # Step 1.9 extrudes the platform cutter downward through the building.
             box = self.draw_step_box(layout, 'PLATFORM', "1.9 Extrude Cutter")
