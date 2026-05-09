@@ -11,11 +11,7 @@ bl_info = {
 import bpy
 import bmesh
 import gpu
-import importlib
-import importlib.util
 import json
-import os
-import sys
 from gpu_extras.batch import batch_for_shader
 from math import atan2, cos, hypot, pi, radians, sin
 from bpy_extras import view3d_utils
@@ -77,6 +73,24 @@ FIXED_LEGO_PALETTE_ITEMS = [
     for index, (name, color) in enumerate(FIXED_LEGO_PALETTE)
 ]
 
+WORKFLOW_ROLE_STYLES = {
+    'SOURCE': {
+        "label": "Source",
+        "icon": 'OBJECT_DATA',
+        "divider": "---- SOURCE ----",
+    },
+    'BUILDING': {
+        "label": "Building",
+        "icon": 'MOD_BUILD',
+        "divider": "---- BUILDING ----",
+    },
+    'PLATFORM': {
+        "label": "Platform",
+        "icon": 'MESH_GRID',
+        "divider": "---- PLATFORM ----",
+    },
+}
+
 
 def get_fixed_palette_color(slot_palette_index):
     return FIXED_LEGO_PALETTE[int(slot_palette_index)][1]
@@ -130,6 +144,10 @@ def apply_single_material_to_object(obj, material):
     for poly in mesh.polygons:
         poly.material_index = 0
     mesh.update()
+
+
+def get_workflow_role_style(role):
+    return WORKFLOW_ROLE_STYLES.get(role, WORKFLOW_ROLE_STYLES['BUILDING'])
 
 
 def update_palette_slot_material(settings, context, slot_index):
@@ -212,6 +230,13 @@ def has_building_object(context):
     if settings is None:
         return False
     return get_building_object(settings) is not None
+
+
+def has_source_objects(context):
+    settings = getattr(context.scene, "miniature_voxeler_settings", None)
+    if settings is None:
+        return False
+    return get_building_object(settings) is not None and get_platform_object(settings) is not None
 
 
 def get_blocks_object(settings):
@@ -870,6 +895,18 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
         poll=lambda self, obj: obj is not None and obj.type == 'MESH',
     )
 
+    show_platform_steps: BoolProperty(
+        name="---- PLATFORM ----",
+        description="Show or hide the platform workflow steps",
+        default=True,
+    )
+
+    show_building_steps: BoolProperty(
+        name="---- BUILDING ----",
+        description="Show or hide the building workflow steps",
+        default=True,
+    )
+
     octree_depth: IntProperty(
         name="Octree Depth",
         default=7,
@@ -1294,6 +1331,10 @@ def get_platform_building_cutter_name(platform_name):
     return f"{platform_name}_Building_Cutter"
 
 
+def get_platform_missing_walls_name(platform_name):
+    return f"{platform_name}_Missing_Walls"
+
+
 def get_platform_foot_name(root_name):
     return f"{root_name}_foot"
 
@@ -1379,6 +1420,36 @@ def mm_to_scene_units(context, mm_value):
     return meters_to_scene_units(context, mm_value * 0.001)
 
 
+def get_object_xy_size_meters(context, obj):
+    scale_length = context.scene.unit_settings.scale_length
+    if scale_length <= 0.0:
+        scale_length = 1.0
+    return obj.dimensions.x * scale_length, obj.dimensions.y * scale_length
+
+
+def get_source_scale_warnings(context, building_obj, platform_obj):
+    warnings = []
+    max_size_m = 0.27
+    platform_min_size_m = 0.23
+
+    # A building or platform wider/deeper than 27 cm usually means the scene scale was not applied correctly.
+    for label, obj in (("Building", building_obj), ("Platform", platform_obj)):
+        size_x_m, size_y_m = get_object_xy_size_meters(context, obj)
+        if size_x_m > max_size_m or size_y_m > max_size_m:
+            warnings.append(
+                f"{label} is {size_x_m * 100.0:.1f} x {size_y_m * 100.0:.1f} cm; expected no X/Y side above 27 cm."
+            )
+
+    # A too-small platform also breaks the expected miniature footprint.
+    platform_x_m, platform_y_m = get_object_xy_size_meters(context, platform_obj)
+    if platform_x_m < platform_min_size_m or platform_y_m < platform_min_size_m:
+        warnings.append(
+            f"Platform is {platform_x_m * 100.0:.1f} x {platform_y_m * 100.0:.1f} cm; expected both X/Y sides at least 23 cm."
+        )
+
+    return warnings
+
+
 def get_platform_copy_object(settings):
     platform_obj = get_platform_object(settings)
     if platform_obj is None:
@@ -1404,6 +1475,16 @@ def get_platform_building_cutter_object(settings):
     if platform_obj is None:
         return None
     obj = bpy.data.objects.get(get_platform_building_cutter_name(platform_obj.name))
+    if obj is None or obj.type != 'MESH':
+        return None
+    return obj
+
+
+def get_platform_missing_walls_object(settings):
+    platform_obj = get_platform_object(settings)
+    if platform_obj is None:
+        return None
+    obj = bpy.data.objects.get(get_platform_missing_walls_name(platform_obj.name))
     if obj is None or obj.type != 'MESH':
         return None
     return obj
@@ -2170,6 +2251,197 @@ def get_selected_edge_groups(obj):
     return groups
 
 
+def world_xy_distance_squared(point_a, point_b):
+    return (point_a.x - point_b.x) ** 2 + (point_a.y - point_b.y) ** 2
+
+
+def get_missing_wall_xy_match_tolerance(cutter_world_verts, edge_world_verts):
+    coords = cutter_world_verts + edge_world_verts
+    if not coords:
+        return 0.0005
+
+    min_x = min(coord.x for coord in coords)
+    max_x = max(coord.x for coord in coords)
+    min_y = min(coord.y for coord in coords)
+    max_y = max(coord.y for coord in coords)
+    xy_span = hypot(max_x - min_x, max_y - min_y)
+    return min(max(xy_span * 0.002, 0.00005), 0.002)
+
+
+def find_target_wall_z_from_cutter(cutter_world_verts, world_point, xy_tolerance):
+    if not cutter_world_verts:
+        return world_point.z
+
+    tolerance_squared = xy_tolerance * xy_tolerance
+    matching_z_values = [
+        vert.z for vert in cutter_world_verts
+        if world_xy_distance_squared(world_point, vert) <= tolerance_squared
+    ]
+    if matching_z_values:
+        return max(matching_z_values)
+
+    # This fallback keeps the tool usable when the selected edge is slightly offset
+    # from the cutter endpoint, but exact/almost-exact XY matches are preferred.
+    best_distance = min(world_xy_distance_squared(world_point, vert) for vert in cutter_world_verts)
+    nearest_z_values = [
+        vert.z for vert in cutter_world_verts
+        if world_xy_distance_squared(world_point, vert) <= best_distance + 0.0000000001
+    ]
+    return max(nearest_z_values) if nearest_z_values else world_point.z
+
+
+def get_mesh_edge_groups(mesh):
+    visited = set()
+    edge_to_verts = {edge.index: tuple(edge.vertices) for edge in mesh.edges}
+    vert_to_edges = {}
+    for edge_index, vert_indices in edge_to_verts.items():
+        for vert_index in vert_indices:
+            vert_to_edges.setdefault(vert_index, []).append(edge_index)
+
+    groups = []
+    for edge in mesh.edges:
+        if edge.index in visited:
+            continue
+
+        stack = [edge.index]
+        group = []
+        while stack:
+            edge_index = stack.pop()
+            if edge_index in visited:
+                continue
+            visited.add(edge_index)
+            group.append(edge_index)
+            for vert_index in edge_to_verts[edge_index]:
+                for linked_edge_index in vert_to_edges.get(vert_index, []):
+                    if linked_edge_index not in visited:
+                        stack.append(linked_edge_index)
+        groups.append(group)
+    return groups
+
+
+def order_edge_group_vertices(mesh, edge_indices):
+    neighbors_by_vert = {}
+    for edge_index in edge_indices:
+        vert_a, vert_b = mesh.edges[edge_index].vertices
+        neighbors_by_vert.setdefault(vert_a, []).append(vert_b)
+        neighbors_by_vert.setdefault(vert_b, []).append(vert_a)
+
+    if not neighbors_by_vert:
+        return []
+
+    endpoints = [vert_index for vert_index, neighbors in neighbors_by_vert.items() if len(neighbors) == 1]
+    start_vert = endpoints[0] if endpoints else next(iter(neighbors_by_vert))
+    ordered = [start_vert]
+    previous_vert = None
+    current_vert = start_vert
+
+    while True:
+        next_vert = None
+        for candidate in neighbors_by_vert.get(current_vert, []):
+            if candidate != previous_vert:
+                next_vert = candidate
+                break
+        if next_vert is None or next_vert in ordered:
+            break
+        ordered.append(next_vert)
+        previous_vert, current_vert = current_vert, next_vert
+
+    return ordered
+
+
+def get_interpolated_top_z_by_vertex(mesh, edge_indices, edge_world_verts, cutter_world_verts, xy_tolerance):
+    ordered_vert_indices = order_edge_group_vertices(mesh, edge_indices)
+    if len(ordered_vert_indices) < 2:
+        return {}
+
+    # The two ends of the selected missing-wall chain are A and B. Their nearest
+    # existing cutter-wall vertices at the same XY provide the top Z values.
+    start_world = edge_world_verts[ordered_vert_indices[0]]
+    end_world = edge_world_verts[ordered_vert_indices[-1]]
+    start_z = find_target_wall_z_from_cutter(cutter_world_verts, start_world, xy_tolerance)
+    end_z = find_target_wall_z_from_cutter(cutter_world_verts, end_world, xy_tolerance)
+
+    distances = [0.0]
+    for index in range(1, len(ordered_vert_indices)):
+        previous_world = edge_world_verts[ordered_vert_indices[index - 1]]
+        current_world = edge_world_verts[ordered_vert_indices[index]]
+        distances.append(distances[-1] + (current_world - previous_world).length)
+
+    total_distance = distances[-1]
+    if total_distance <= 0.0:
+        return {vert_index: start_z for vert_index in ordered_vert_indices}
+
+    top_z_by_vertex = {}
+    for index, vert_index in enumerate(ordered_vert_indices):
+        blend = distances[index] / total_distance
+        top_z_by_vertex[vert_index] = start_z + (end_z - start_z) * blend
+    return top_z_by_vertex
+
+
+def build_missing_wall_faces_from_edge_object(cutter_obj, edge_obj):
+    if cutter_obj is None or edge_obj is None:
+        return 0
+
+    edge_mesh = edge_obj.data
+    if not edge_mesh.edges:
+        return 0
+
+    cutter_world_to_local = cutter_obj.matrix_world.inverted()
+    cutter_world_verts = [cutter_obj.matrix_world @ vert.co for vert in cutter_obj.data.vertices]
+    edge_world_verts = [edge_obj.matrix_world @ vert.co for vert in edge_mesh.vertices]
+    if not cutter_world_verts or not edge_world_verts:
+        return 0
+
+    bm = bmesh.new()
+    bm.from_mesh(cutter_obj.data)
+    xy_tolerance = get_missing_wall_xy_match_tolerance(cutter_world_verts, edge_world_verts)
+
+    created_faces = 0
+    for edge_indices in get_mesh_edge_groups(edge_mesh):
+        top_z_by_vertex = get_interpolated_top_z_by_vertex(
+            edge_mesh,
+            edge_indices,
+            edge_world_verts,
+            cutter_world_verts,
+            xy_tolerance,
+        )
+
+        for edge_index in edge_indices:
+            edge = edge_mesh.edges[edge_index]
+            bottom_a_world = edge_world_verts[edge.vertices[0]]
+            bottom_b_world = edge_world_verts[edge.vertices[1]]
+            top_a_world = Vector((
+                bottom_a_world.x,
+                bottom_a_world.y,
+                top_z_by_vertex.get(edge.vertices[0], bottom_a_world.z),
+            ))
+            top_b_world = Vector((
+                bottom_b_world.x,
+                bottom_b_world.y,
+                top_z_by_vertex.get(edge.vertices[1], bottom_b_world.z),
+            ))
+
+            # Each selected platform edge becomes one vertical quad, extruded up
+            # to the A/B heights inferred from the neighboring wall cutter.
+            verts = [
+                bm.verts.new(cutter_world_to_local @ bottom_a_world),
+                bm.verts.new(cutter_world_to_local @ bottom_b_world),
+                bm.verts.new(cutter_world_to_local @ top_b_world),
+                bm.verts.new(cutter_world_to_local @ top_a_world),
+            ]
+            try:
+                bm.faces.new(verts)
+                created_faces += 1
+            except ValueError:
+                pass
+
+    bm.normal_update()
+    bm.to_mesh(cutter_obj.data)
+    cutter_obj.data.update()
+    bm.free()
+    return created_faces
+
+
 def selected_edge_group_z_values(edge_group):
     values = []
     seen = set()
@@ -2664,7 +2936,6 @@ def enter_edit_vertex_wireframe(context, obj):
         bpy.ops.object.mode_set(mode='EDIT')
     bpy.ops.mesh.select_mode(type='VERT')
     bpy.ops.mesh.select_all(action='DESELECT')
-    obj.display_type = 'TEXTURED'
 
 
 def get_enabled_color_skin_slots(settings):
@@ -2846,7 +3117,8 @@ def generate_north_south_skin_from_mask(context, mask_obj, settings, root_name, 
     if temp_source.name in bpy.data.objects:
         bpy.data.objects.remove(temp_source, do_unlink=True)
 
-    return boolean_union_objects(context, axis_skin_objects, get_color_skin_name(root_name, slot_index))
+    joined_obj = boolean_union_objects(context, axis_skin_objects, get_color_skin_name(root_name, slot_index))
+    return joined_obj
 
 
 def process_skin_object(context, obj, settings, axis_vec):
@@ -3422,21 +3694,35 @@ class MINIATUREVOXELER_OT_apply_all_transforms(Operator):
 
     @classmethod
     def poll(cls, context):
-        return has_building_object(context)
+        return has_source_objects(context)
 
     def execute(self, context):
         settings = context.scene.miniature_voxeler_settings
-        obj = get_building_object(settings)
-        if obj is None:
-            self.report({'ERROR'}, "Pick a Building mesh first.")
+        building_obj = get_building_object(settings)
+        platform_obj = get_platform_object(settings)
+        if building_obj is None or platform_obj is None:
+            self.report({'ERROR'}, "Pick both a Building and Platform mesh first.")
             return {'CANCELLED'}
 
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
 
-        set_active_object(context, obj)
-        bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
-        self.report({'INFO'}, f"Applied all transforms to {obj.name}")
+        for obj in (building_obj, platform_obj):
+            set_active_object(context, obj)
+            bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+
+        warnings = get_source_scale_warnings(context, building_obj, platform_obj)
+        if warnings:
+            show_info_popup(
+                context,
+                "Check Source Scale",
+                warnings,
+                icon='ERROR',
+            )
+            self.report({'WARNING'}, "Applied transforms, but source scale looks wrong. Check the warning popup.")
+            return {'FINISHED'}
+
+        self.report({'INFO'}, f"Applied all transforms to {building_obj.name} and {platform_obj.name}.")
         return {'FINISHED'}
 
 
@@ -4289,6 +4575,7 @@ class MINIATUREVOXELER_OT_prepare_platform_copy(Operator):
 
         new_obj = duplicate_object(context, platform_obj, get_platform_copy_name(platform_obj.name))
         set_metadata(new_obj, get_root_name(building_obj.name), platform_obj.name)
+        building_obj.hide_set(True)
         platform_obj.hide_set(True)
         new_obj.hide_set(False)
         set_active_object(context, new_obj)
@@ -4298,17 +4585,17 @@ class MINIATUREVOXELER_OT_prepare_platform_copy(Operator):
         bpy.ops.mesh.dissolve_limited(angle_limit=settings.platform_limited_dissolve_angle)
         bpy.ops.object.mode_set(mode='OBJECT')
 
-        self.report({'INFO'}, f"Created {new_obj.name}, hid {platform_obj.name}, and applied Limited Dissolve.")
+        self.report({'INFO'}, f"Created {new_obj.name}, hid source objects, and applied Limited Dissolve.")
         return {'FINISHED'}
 
 
 # ------------------------------------------------------------
-# Operator 10: Select and Separate Platform Cutter
+# Operator 10: Select and Separate Platform Hole Walls
 # ------------------------------------------------------------
 
 class MINIATUREVOXELER_OT_prepare_platform_walls_selection(Operator):
     bl_idname = "object.mv_platform_walls_select"
-    bl_label = "Select Platform Cutter"
+    bl_label = "Select Hole Wall Faces"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -4319,21 +4606,22 @@ class MINIATUREVOXELER_OT_prepare_platform_walls_selection(Operator):
         settings = context.scene.miniature_voxeler_settings
         obj = get_platform_copy_object(settings)
         if obj is None:
-            self.report({'ERROR'}, "Run Step 9 first so the platform copy exists.")
+            self.report({'ERROR'}, "Run Step 1.1 first so the platform copy exists.")
             return {'CANCELLED'}
 
+        # Step 1.2 begins in Face select because the existing hole walls are already real faces.
         set_active_object(context, obj)
         if context.mode != 'EDIT_MESH':
             bpy.ops.object.mode_set(mode='EDIT')
         bpy.ops.mesh.select_mode(type='FACE')
         bpy.ops.mesh.select_all(action='DESELECT')
-        self.report({'INFO'}, f"Select the cutter faces on {obj.name}, then run Separate Selected Cutter.")
+        self.report({'INFO'}, f"Select the hole wall faces on {obj.name}, then run Separate Hole Walls.")
         return {'FINISHED'}
 
 
 class MINIATUREVOXELER_OT_separate_platform_walls(Operator):
     bl_idname = "object.mv_platform_walls_separate"
-    bl_label = "Separate Selected Cutter"
+    bl_label = "Separate Hole Walls"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -4345,7 +4633,7 @@ class MINIATUREVOXELER_OT_separate_platform_walls(Operator):
         building_obj = get_building_object(settings)
         platform_copy = get_platform_copy_object(settings)
         if building_obj is None or platform_copy is None:
-            self.report({'ERROR'}, "Run Step 9 first so the platform copy exists.")
+            self.report({'ERROR'}, "Run Step 1.1 first so the platform copy exists.")
             return {'CANCELLED'}
 
         if context.mode != 'EDIT_MESH':
@@ -4369,6 +4657,7 @@ class MINIATUREVOXELER_OT_separate_platform_walls(Operator):
         if existing_walls is not None:
             remove_object_if_exists(existing_walls)
 
+        # Separate selected faces into the cutter object, but keep the copy alive for Step 1.3 edge selection.
         pre_names = set(obj.name for obj in bpy.data.objects)
         bpy.ops.mesh.separate(type='SELECTED')
         bpy.ops.object.mode_set(mode='OBJECT')
@@ -4380,11 +4669,131 @@ class MINIATUREVOXELER_OT_separate_platform_walls(Operator):
 
         new_obj.name = get_platform_walls_name(platform_name)
         set_metadata(new_obj, get_root_name(building_obj.name), platform_copy.name)
-        remove_object_if_exists(platform_copy)
-        new_obj.display_type = 'TEXTURED'
+        set_active_object(context, platform_copy)
+
+        self.report({'INFO'}, f"Separated {selected_count} wall face(s) into {new_obj.name}. Platform copy is still available for missing-wall edge selection.")
+        return {'FINISHED'}
+
+
+class MINIATUREVOXELER_OT_prepare_platform_missing_walls_selection(Operator):
+    bl_idname = "object.mv_platform_missing_walls_select"
+    bl_label = "Select Missing Wall Edges"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return has_platform_copy_object(context)
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        obj = get_platform_copy_object(settings)
+        if obj is None:
+            self.report({'ERROR'}, "Create the editable platform copy first.")
+            return {'CANCELLED'}
+
+        set_active_object(context, obj)
+        if context.mode != 'EDIT_MESH':
+            bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_mode(type='EDGE')
+        bpy.ops.mesh.select_all(action='DESELECT')
+        self.report({'INFO'}, f"Select platform boundary edges on {obj.name}, then run Separate Missing Wall Edges.")
+        return {'FINISHED'}
+
+
+class MINIATUREVOXELER_OT_separate_platform_missing_walls(Operator):
+    bl_idname = "object.mv_platform_missing_walls_separate"
+    bl_label = "Separate Missing Wall Edges"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return has_platform_copy_object(context)
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        building_obj = get_building_object(settings)
+        platform_copy = get_platform_copy_object(settings)
+        platform_obj = get_platform_object(settings)
+        if building_obj is None or platform_copy is None or platform_obj is None:
+            self.report({'ERROR'}, "Pick sources and create the editable platform copy first.")
+            return {'CANCELLED'}
+
+        if context.mode != 'EDIT_MESH':
+            set_active_object(context, platform_copy)
+            bpy.ops.object.mode_set(mode='EDIT')
+        elif context.edit_object != platform_copy:
+            bpy.ops.object.mode_set(mode='OBJECT')
+            set_active_object(context, platform_copy)
+            bpy.ops.object.mode_set(mode='EDIT')
+
+        bpy.ops.mesh.select_mode(type='EDGE')
+        bm = bmesh.from_edit_mesh(platform_copy.data)
+        bm.edges.ensure_lookup_table()
+        selected_count = sum(1 for edge in bm.edges if edge.select)
+        if selected_count == 0:
+            self.report({'ERROR'}, "Select at least one platform edge for the missing wall path.")
+            return {'CANCELLED'}
+
+        # Only one missing-wall edge object should represent the current repair pass.
+        existing_missing = get_platform_missing_walls_object(settings)
+        if existing_missing is not None:
+            remove_object_if_exists(existing_missing)
+
+        # The selected platform edges are separated as their own temporary mesh for Step 1.3.
+        pre_names = set(obj.name for obj in bpy.data.objects)
+        bpy.ops.mesh.separate(type='SELECTED')
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        new_obj = find_new_object(pre_names, platform_copy, context)
+        if new_obj is None:
+            self.report({'ERROR'}, "Could not identify the separated missing-wall edge object.")
+            return {'CANCELLED'}
+
+        new_obj.name = get_platform_missing_walls_name(platform_obj.name)
+        set_metadata(new_obj, get_root_name(building_obj.name), platform_copy.name)
         set_active_object(context, new_obj)
 
-        self.report({'INFO'}, f"Separated {selected_count} face(s) into {new_obj.name} and deleted the platform copy.")
+        self.report({'INFO'}, f"Separated {selected_count} missing-wall edge(s) into {new_obj.name}.")
+        return {'FINISHED'}
+
+
+class MINIATUREVOXELER_OT_build_platform_missing_walls(Operator):
+    bl_idname = "object.mv_platform_missing_walls_build"
+    bl_label = "Build Missing Wall Faces"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        settings = getattr(context.scene, "miniature_voxeler_settings", None)
+        return (
+            settings is not None and
+            get_platform_walls_object(settings) is not None and
+            get_platform_missing_walls_object(settings) is not None
+        )
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        cutter_obj = get_platform_walls_object(settings)
+        missing_obj = get_platform_missing_walls_object(settings)
+        platform_copy = get_platform_copy_object(settings)
+        if cutter_obj is None or missing_obj is None:
+            self.report({'ERROR'}, "Separate hole wall faces and missing wall edges first.")
+            return {'CANCELLED'}
+
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        # Convert the separated edge path into vertical wall faces and append them to the cutter.
+        face_count = build_missing_wall_faces_from_edge_object(cutter_obj, missing_obj)
+        if face_count == 0:
+            self.report({'ERROR'}, "Could not build missing wall faces from the separated edge object.")
+            return {'CANCELLED'}
+
+        # Once the missing walls are baked into the cutter, the temporary selection meshes are no longer needed.
+        remove_object_if_exists(missing_obj)
+        remove_object_if_exists(platform_copy)
+        set_active_object(context, cutter_obj)
+        self.report({'INFO'}, f"Built {face_count} missing wall face(s) into {cutter_obj.name} and removed temporary platform objects.")
         return {'FINISHED'}
 
 
@@ -4476,7 +4885,6 @@ class MINIATUREVOXELER_OT_merge_platform_walls_at_center(Operator):
 
         bpy.ops.mesh.merge(type='CENTER')
         bpy.ops.mesh.select_all(action='DESELECT')
-        obj.display_type = 'TEXTURED'
         self.report({'INFO'}, f"Merged {selected_count} selected vertices at center on {obj.name}.")
         return {'FINISHED'}
 
@@ -4513,7 +4921,6 @@ class MINIATUREVOXELER_OT_cleanup_platform_limited_dissolve(Operator):
         bpy.ops.mesh.select_all(action='SELECT')
         bpy.ops.mesh.dissolve_limited(angle_limit=settings.platform_cleanup_dissolve_angle)
         bpy.ops.mesh.select_all(action='DESELECT')
-        obj.display_type = 'TEXTURED'
 
         angle_deg = settings.platform_cleanup_dissolve_angle * 180.0 / pi
         self.report({'INFO'}, f"Ran Limited Dissolve on {obj.name} at {angle_deg:.3f} degrees.")
@@ -4871,31 +5278,32 @@ class MINIATUREVOXELER_PT_panel(Panel):
     bl_region_type = 'UI'
     bl_category = "Miniature Voxeler"
 
-    @staticmethod
-    def has_bool_tool_operator(operator_name):
-        try:
-            getattr(bpy.ops.object, operator_name).get_rna_type()
-            return True
-        except Exception:
-            return False
-
-    @classmethod
-    def has_bool_tool_operators(cls):
-        return all(
-            cls.has_bool_tool_operator(operator_name)
-            for operator_name in (
-                "boolean_auto_difference",
-                "boolean_auto_slice",
-                "boolean_brush_difference",
-                "boolean_brush_slice",
-            )
+    def draw_path_divider(self, layout, settings, role, expanded_property):
+        style = get_workflow_role_style(role)
+        is_expanded = getattr(settings, expanded_property)
+        layout.separator()
+        row = layout.row(align=True)
+        row.prop(
+            settings,
+            expanded_property,
+            text=style["divider"],
+            icon='TRIA_DOWN' if is_expanded else 'TRIA_RIGHT',
+            emboss=False,
         )
+        layout.separator()
+        return is_expanded
 
-    def draw_cleanup_toolbox(self, layout, settings, title, description):
+    def draw_step_box(self, layout, role, title, description=None):
+        style = get_workflow_role_style(role)
         box = layout.box()
-        box.alert = True
-        box.label(text=title)
-        box.label(text=description)
+        header = box.row(align=True)
+        header.label(text=title, icon=style["icon"])
+        if description:
+            box.label(text=description)
+        return box
+
+    def draw_cleanup_toolbox(self, layout, settings, role, title, description):
+        box = self.draw_step_box(layout, role, title, description)
         col = box.column(align=True)
         col.prop(settings, "platform_merge_distance")
         row = col.row(align=True)
@@ -4917,189 +5325,201 @@ class MINIATUREVOXELER_PT_panel(Panel):
         header.label(text="Miniature Voxeler")
         header.label(text=ADDON_VERSION_TEXT)
 
-        box = layout.box()
-        box.label(text="1. Source")
+        # Step 0 identifies the original meshes that drive both workflows.
+        box = self.draw_step_box(layout, 'SOURCE', "0. Source", "Choose the building and platform meshes.")
         col = box.column(align=True)
         col.prop(settings, "building_object")
         col.prop(settings, "platform_object")
-        box.operator("object.miniature_voxeler_apply_all_transforms", text="Apply Transforms To Building", icon='OBJECT_DATA')
-        if building_obj is None:
+        box.operator("object.miniature_voxeler_apply_all_transforms", text="Apply Transforms To Sources", icon='OBJECT_DATA')
+        if building_obj is None and platform_obj is None:
+            box.label(text="Choose a Building mesh and Platform mesh first.")
+        elif building_obj is None:
             box.label(text="Choose a Building mesh first.")
         elif platform_obj is None:
-            box.label(text="Optional now, but required for foot / hole workflow.")
+            box.label(text="Choose a Platform mesh first.")
         else:
             box.label(text="Building and Platform are ready.")
 
-        box = layout.box()
-        box.label(text="2. Platform Footprint")
-        box.label(text="Use this only if you need the platform hole and print foot.")
-        col = box.column(align=True)
-        col.prop(settings, "platform_limited_dissolve_angle")
-        col.operator("object.miniature_voxeler_prepare_platform_copy", text="Create Editable Platform Copy", icon='DUPLICATE')
+        # Platform path steps are grouped together because they prepare the hole, cutter, and foot.
+        if self.draw_path_divider(layout, settings, 'PLATFORM', "show_platform_steps"):
+            # Step 1.1 starts the platform branch by making a disposable copy for hole selection.
+            box = self.draw_step_box(layout, 'PLATFORM', "1.1 Platform Footprint", "Use this only if you need the platform hole and print foot.")
+            col = box.column(align=True)
+            col.prop(settings, "platform_limited_dissolve_angle")
+            col.operator("object.miniature_voxeler_prepare_platform_copy", text="Create Editable Platform Copy", icon='DUPLICATE')
 
-        row = box.row(align=True)
-        row.operator("object.mv_platform_walls_select", text="Select Hole Faces", icon='FACESEL')
-        row.operator("object.mv_platform_walls_separate", text="Separate Hole Mesh", icon='MESH_CUBE')
+            # Step 1.2 extracts the existing vertical wall faces from the clean platform copy.
+            box = self.draw_step_box(layout, 'PLATFORM', "1.2 Hole Walls (Faces)", "Select the visible hole wall faces, then separate them.")
+            row = box.row(align=True)
+            row.operator("object.mv_platform_walls_select", text="Select Hole Faces", icon='FACESEL')
+            row.operator("object.mv_platform_walls_separate", text="Separate Hole Walls", icon='MESH_CUBE')
 
-        self.draw_cleanup_toolbox(
-            layout,
-            settings,
-            "3. Clean Hole",
-            "Clean the separated hole mesh before storing the upper loop.",
-        )
+            # Step 1.3 extracts platform boundary edges that should become missing wall faces.
+            box = self.draw_step_box(layout, 'PLATFORM', "1.3 Missing Walls (Edges)", "Select platform boundary edges that should become missing walls.")
+            repair_row = box.row(align=True)
+            repair_row.operator("object.mv_platform_missing_walls_select", text="Select Missing Wall Edges", icon='EDGESEL')
+            repair_row.operator("object.mv_platform_missing_walls_separate", text="Separate Missing Wall Edges", icon='MESH_DATA')
+            box.operator("object.mv_platform_missing_walls_build", text="Build Missing Wall Faces", icon='MESH_CUBE')
 
-        box = layout.box()
-        box.label(text="4. Store Ring")
-        box.operator("object.mv_platform_wall_loop", text="Store Upper Loop And Reduce To Ring", icon='EDGESEL')
-        if walls_obj is None:
-            box.label(text="Separate the platform cutter first.")
-        else:
-            box.label(text=f"Current cutter object: {walls_obj.name}")
-
-        box = layout.box()
-        box.label(text="5. Build 2D Cutter")
-        cutter_col = box.column(align=True)
-        cutter_col.prop(settings, "platform_inner_thickness_mm")
-        cutter_col.prop(settings, "platform_outer_thickness_mm")
-        cutter_col.operator("object.mv_platform_walls_extrude", text="Build 2D Cutter", icon='MESH_GRID')
-
-        self.draw_cleanup_toolbox(
-            layout,
-            settings,
-            "6. Clean 2D Cutter",
-            "Visually inspect the cutter for overlaps before continuing.",
-        )
-
-        box = layout.box()
-        box.label(text="7. Close 2D Cutter")
-        box.label(text="Merges the inner loop to center.")
-        box.label(text="Inspect and manually fix holes or strange areas before the next step.")
-        box.operator("object.mv_platform_cutter_close_2d", text="Merge Inner Loop To Center", icon='FACESEL')
-
-        box = layout.box()
-        box.label(text="8. Extrude Cutter")
-        box.prop(settings, "platform_cutter_depth_mm")
-        box.operator("object.mv_platform_walls_build_mesh", text="Extrude Cutter Down", icon='MESH_CUBE')
-
-        box = layout.box()
-        box.label(text="9. Smooth Cutter")
-        remesh_col = box.column(align=True)
-        remesh_col.prop(settings, "platform_remesh_octree_depth")
-        remesh_col.prop(settings, "platform_remesh_scale")
-        remesh_col.prop(settings, "platform_remesh_remove_disconnected")
-        remesh_col.operator("object.mv_platform_cutter_smooth_remesh", text="Smooth Remesh Cutter", icon='MOD_REMESH')
-
-        box = layout.box()
-        box.label(text="10. Slice Building")
-        box.operator("object.mv_platform_building_slice", text="Slice Building And Create _foot", icon='SELECT_DIFFERENCE')
-        if foot_obj is not None:
-            box.label(text=f"Current foot object: {foot_obj.name}")
-
-        box = layout.box()
-        box.label(text="11. Voxel Building")
-        voxel_col = box.column(align=True)
-        voxel_col.prop(settings, "octree_depth")
-        voxel_col.prop(settings, "scale")
-        voxel_col.prop(settings, "voxel_size_mm")
-        voxel_col.prop(settings, "threshold")
-        voxel_col.prop(settings, "remove_disconnected")
-        voxel_col.operator("object.miniature_voxeler_block_remesh", text="Voxelize Building", icon='MOD_REMESH')
-        if blocks_obj is None:
-            box.label(text="This creates the cube grid used by the rest of the workflow.")
-        else:
-            box.label(text=f"Current voxel object: {blocks_obj.name}")
-
-        box = layout.box()
-        box.label(text="12. Remove XY Wall Layers")
-        box.label(text="Post-voxel inset: removes exterior side cubes only.")
-        box.prop(settings, "voxel_xy_wall_layers")
-        box.operator("object.mv_voxel_xy_wall_layers_remove", text="Remove XY Wall Layers", icon='SELECT_SUBTRACT')
-
-        box = layout.box()
-        box.label(text="13. Connect With Foot")
-        box.label(text="Adds one cube under each lowest XY column per click.")
-        box.operator("object.mv_voxel_connect_to_foot", text="Add One Lower Cube Layer", icon='SNAP_ON')
-
-        box = layout.box()
-        box.label(text="14. Texture And Color")
-        col = box.column(align=True)
-        box.operator("object.miniature_voxeler_smart_uv_project", text="Generate UVs", icon='UV')
-        col.prop(settings, "texture_source_name")
-        col.prop(settings, "texture_size")
-        col.prop(settings, "texture_margin")
-        box.operator("object.miniature_voxeler_transfer_texture", text="Transfer Texture", icon='TEXTURE')
-        col.prop(settings, "lego_color_count")
-        col.prop(settings, "lego_color_sample_mode")
-        col.prop(settings, "lego_color_assign_mode")
-        box.operator("object.miniature_voxeler_lego_color", text="Create Color Slots", icon='MATERIAL')
-
-        smooth_box = box.box()
-        smooth_box.label(text="Smooth Colors")
-        smooth_col = smooth_box.column(align=True)
-        smooth_col.prop(settings, "lego_smooth_weight")
-        smooth_col.prop(settings, "lego_smooth_passes")
-        smooth_col.prop(settings, "lego_smooth_min_neighbors")
-        smooth_box.operator("object.miniature_voxeler_smooth_lego_color", icon='MOD_SMOOTH')
-
-        palette_box = box.box()
-        palette_box.label(text="Paint And Cleanup")
-        palette_box.prop(settings, "lego_paint_brush_size")
-        palette_col = palette_box.column(align=True)
-        active_painter = MINIATUREVOXELER_OT_paint_lego_slot._active_painter
-
-        for slot_index in range(settings.lego_color_count):
-            row = palette_col.row(align=True)
-            swatch = row.row(align=True)
-            swatch.enabled = False
-            swatch.prop(settings, f"lego_palette_slot_color_{slot_index + 1}", text="")
-            row.prop(settings, f"lego_palette_slot_{slot_index + 1}")
-            is_active_paint_slot = (
-                active_painter is not None and
-                not getattr(active_painter, "_cancel_requested", False) and
-                active_painter.slot_index == slot_index
+            self.draw_cleanup_toolbox(
+                layout,
+                settings,
+                'PLATFORM',
+                "1.4 Clean Cutter",
+                "Clean the combined cutter wall mesh before storing the upper loop.",
             )
-            icon = 'RADIOBUT_ON' if is_active_paint_slot else 'RADIOBUT_OFF'
-            op = row.operator(
-                "object.miniature_voxeler_paint_lego_slot",
-                text="",
-                icon=icon,
-                depress=is_active_paint_slot,
+
+            # Step 1.5 stores the upper platform loop as the reusable cutter path.
+            box = self.draw_step_box(layout, 'PLATFORM', "1.5 Store Ring")
+            box.operator("object.mv_platform_wall_loop", text="Store Upper Loop And Reduce To Ring", icon='EDGESEL')
+            if walls_obj is None:
+                box.label(text="Separate the platform cutter first.")
+            else:
+                box.label(text=f"Current cutter object: {walls_obj.name}")
+
+            # Step 1.6 expands the stored ring into an editable 2D cutter guide.
+            box = self.draw_step_box(layout, 'PLATFORM', "1.6 Build 2D Cutter")
+            cutter_col = box.column(align=True)
+            cutter_col.prop(settings, "platform_inner_thickness_mm")
+            cutter_col.prop(settings, "platform_outer_thickness_mm")
+            cutter_col.operator("object.mv_platform_walls_extrude", text="Build 2D Cutter", icon='MESH_GRID')
+
+            self.draw_cleanup_toolbox(
+                layout,
+                settings,
+                'PLATFORM',
+                "1.7 Clean 2D Cutter",
+                "Visually inspect the cutter for overlaps before continuing.",
             )
-            op.slot_index = slot_index
 
-        palette_box.label(text="Paint: left-drag paints, I picks a slot, F changes brush size.")
-        voxel_box = palette_box.box()
-        voxel_box.label(text="Cube Cleanup")
-        voxel_row = voxel_box.row(align=True)
-        add_op = voxel_row.operator("object.miniature_voxeler_edit_voxel_cells", text="Add Cubes", icon='ADD')
-        add_op.action = 'ADD'
-        remove_op = voxel_row.operator("object.miniature_voxeler_edit_voxel_cells", text="Remove Cubes", icon='REMOVE')
-        remove_op.action = 'REMOVE'
-        voxel_box.label(text="Uses the same brush size as paint mode.")
+            # Step 1.8 closes the 2D cutter so it can become solid geometry.
+            box = self.draw_step_box(layout, 'PLATFORM', "1.8 Close 2D Cutter")
+            box.label(text="Merges the inner loop to center.")
+            box.label(text="Inspect and manually fix holes or strange areas before the next step.")
+            box.operator("object.mv_platform_cutter_close_2d", text="Merge Inner Loop To Center", icon='FACESEL')
 
-        box = layout.box()
-        box.label(text="15. Export Pieces")
-        col = box.column(align=True)
-        col.prop(settings, "color_skin_base_slot")
-        col.prop(settings, "outer_skin_mm")
-        col.prop(settings, "inset_amount")
-        col.prop(settings, "inside_skin_mm")
-        col.prop(settings, "make_boolean_base")
+            # Step 1.9 extrudes the platform cutter downward through the building.
+            box = self.draw_step_box(layout, 'PLATFORM', "1.9 Extrude Cutter")
+            box.prop(settings, "platform_cutter_depth_mm")
+            box.operator("object.mv_platform_walls_build_mesh", text="Extrude Cutter Down", icon='MESH_CUBE')
 
-        box.label(text="Skin Slots")
-        row = box.row(align=True)
-        row.prop(settings, "color_skin_slot_1")
-        row.prop(settings, "color_skin_slot_2")
+            # Step 1.10 remeshes the cutter to soften or repair the platform cut shape.
+            box = self.draw_step_box(layout, 'PLATFORM', "1.10 Smooth Cutter")
+            remesh_col = box.column(align=True)
+            remesh_col.prop(settings, "platform_remesh_octree_depth")
+            remesh_col.prop(settings, "platform_remesh_scale")
+            remesh_col.prop(settings, "platform_remesh_remove_disconnected")
+            remesh_col.operator("object.mv_platform_cutter_smooth_remesh", text="Smooth Remesh Cutter", icon='MOD_REMESH')
 
-        row = box.row(align=True)
-        row.prop(settings, "color_skin_slot_3")
-        row.prop(settings, "color_skin_slot_4")
+            # Step 1.11 uses the platform cutter to split the building copy and print foot.
+            box = self.draw_step_box(layout, 'PLATFORM', "1.11 Slice Building")
+            box.operator("object.mv_platform_building_slice", text="Slice Building And Create _foot", icon='SELECT_DIFFERENCE')
+            if foot_obj is not None:
+                box.label(text=f"Current foot object: {foot_obj.name}")
 
-        box.operator("object.miniature_voxeler_generate_color_skin", text="Generate Colored Shell Pieces", icon='MATERIAL')
+        # Building path steps are grouped together because they create, color, clean, and export the voxel body.
+        if self.draw_path_divider(layout, settings, 'BUILDING', "show_building_steps"):
+            # Step 2.1 switches back to the building branch and creates the block mesh.
+            box = self.draw_step_box(layout, 'BUILDING', "2.1 Voxel Building")
+            voxel_col = box.column(align=True)
+            voxel_col.prop(settings, "octree_depth")
+            voxel_col.prop(settings, "scale")
+            voxel_col.prop(settings, "voxel_size_mm")
+            voxel_col.prop(settings, "threshold")
+            voxel_col.prop(settings, "remove_disconnected")
+            voxel_col.operator("object.miniature_voxeler_block_remesh", text="Voxelize Building", icon='MOD_REMESH')
+            if blocks_obj is None:
+                box.label(text="This creates the cube grid used by the rest of the workflow.")
+            else:
+                box.label(text=f"Current voxel object: {blocks_obj.name}")
 
-        if _embedded_bool_tool_error:
-            box = layout.box()
-            box.label(text=_embedded_bool_tool_error)
+            # Step 2.2 trims voxel side walls from the building blocks after voxelization.
+            box = self.draw_step_box(layout, 'BUILDING', "2.2 Remove XY Wall Layers")
+            box.label(text="Post-voxel inset: removes exterior side cubes only.")
+            box.prop(settings, "voxel_xy_wall_layers")
+            box.operator("object.mv_voxel_xy_wall_layers_remove", text="Remove XY Wall Layers", icon='SELECT_SUBTRACT')
+
+            # Step 2.3 grows the building voxels downward until they meet the platform foot.
+            box = self.draw_step_box(layout, 'BUILDING', "2.3 Connect With Foot")
+            box.label(text="Adds one cube under each lowest XY column per click.")
+            box.operator("object.mv_voxel_connect_to_foot", text="Add One Lower Cube Layer", icon='SNAP_ON')
+
+            # Step 2.4 bakes the building texture and turns it into fixed Lego color slots.
+            box = self.draw_step_box(layout, 'BUILDING', "2.4 Texture And Color")
+            col = box.column(align=True)
+            box.operator("object.miniature_voxeler_smart_uv_project", text="Generate UVs", icon='UV')
+            col.prop(settings, "texture_source_name")
+            col.prop(settings, "texture_size")
+            col.prop(settings, "texture_margin")
+            box.operator("object.miniature_voxeler_transfer_texture", text="Transfer Texture", icon='TEXTURE')
+            col.prop(settings, "lego_color_count")
+            col.prop(settings, "lego_color_sample_mode")
+            col.prop(settings, "lego_color_assign_mode")
+            box.operator("object.miniature_voxeler_lego_color", text="Create Color Slots", icon='MATERIAL')
+
+            smooth_box = box.box()
+            smooth_box.label(text="Smooth Colors")
+            smooth_col = smooth_box.column(align=True)
+            smooth_col.prop(settings, "lego_smooth_weight")
+            smooth_col.prop(settings, "lego_smooth_passes")
+            smooth_col.prop(settings, "lego_smooth_min_neighbors")
+            smooth_box.operator("object.miniature_voxeler_smooth_lego_color", icon='MOD_SMOOTH')
+
+            palette_box = box.box()
+            palette_box.label(text="Paint And Cleanup")
+            palette_box.prop(settings, "lego_paint_brush_size")
+            palette_col = palette_box.column(align=True)
+            active_painter = MINIATUREVOXELER_OT_paint_lego_slot._active_painter
+
+            for slot_index in range(settings.lego_color_count):
+                row = palette_col.row(align=True)
+                swatch = row.row(align=True)
+                swatch.enabled = False
+                swatch.prop(settings, f"lego_palette_slot_color_{slot_index + 1}", text="")
+                row.prop(settings, f"lego_palette_slot_{slot_index + 1}")
+                is_active_paint_slot = (
+                    active_painter is not None and
+                    not getattr(active_painter, "_cancel_requested", False) and
+                    active_painter.slot_index == slot_index
+                )
+                icon = 'RADIOBUT_ON' if is_active_paint_slot else 'RADIOBUT_OFF'
+                op = row.operator(
+                    "object.miniature_voxeler_paint_lego_slot",
+                    text="",
+                    icon=icon,
+                    depress=is_active_paint_slot,
+                )
+                op.slot_index = slot_index
+
+            palette_box.label(text="Paint: left-drag paints, I picks a slot, F changes brush size.")
+            voxel_box = palette_box.box()
+            voxel_box.label(text="Cube Cleanup")
+            voxel_row = voxel_box.row(align=True)
+            add_op = voxel_row.operator("object.miniature_voxeler_edit_voxel_cells", text="Add Cubes", icon='ADD')
+            add_op.action = 'ADD'
+            remove_op = voxel_row.operator("object.miniature_voxeler_edit_voxel_cells", text="Remove Cubes", icon='REMOVE')
+            remove_op.action = 'REMOVE'
+            voxel_box.label(text="Uses the same brush size as paint mode.")
+
+            # Step 2.5 exports the colored building shell pieces for downstream use.
+            box = self.draw_step_box(layout, 'BUILDING', "2.5 Export Pieces")
+            col = box.column(align=True)
+            col.prop(settings, "color_skin_base_slot")
+            col.prop(settings, "outer_skin_mm")
+            col.prop(settings, "inset_amount")
+            col.prop(settings, "inside_skin_mm")
+            col.prop(settings, "make_boolean_base")
+
+            box.label(text="Skin Slots")
+            row = box.row(align=True)
+            row.prop(settings, "color_skin_slot_1")
+            row.prop(settings, "color_skin_slot_2")
+
+            row = box.row(align=True)
+            row.prop(settings, "color_skin_slot_3")
+            row.prop(settings, "color_skin_slot_4")
+
+            box.operator("object.miniature_voxeler_generate_color_skin", text="Generate Colored Shell Pieces", icon='MATERIAL')
 
 # ------------------------------------------------------------
 # Register
@@ -5119,6 +5539,9 @@ classes = (
     MINIATUREVOXELER_OT_prepare_platform_copy,
     MINIATUREVOXELER_OT_prepare_platform_walls_selection,
     MINIATUREVOXELER_OT_separate_platform_walls,
+    MINIATUREVOXELER_OT_prepare_platform_missing_walls_selection,
+    MINIATUREVOXELER_OT_separate_platform_missing_walls,
+    MINIATUREVOXELER_OT_build_platform_missing_walls,
     MINIATUREVOXELER_OT_merge_platform_walls_by_distance,
     MINIATUREVOXELER_OT_merge_platform_walls_at_center,
     MINIATUREVOXELER_OT_cleanup_platform_limited_dissolve,
@@ -5144,96 +5567,7 @@ stale_class_names = (
     "MINIATUREVOXELER_OT_inset_building_copy",
 )
 
-EMBEDDED_BOOL_TOOL_PACKAGE = "miniature_voxeler_embedded_bool_tool"
-_embedded_bool_tool_modules = []
-_embedded_bool_tool_error = ""
-
-
-def get_miniature_voxeler_directory():
-    candidates = []
-
-    module_file = globals().get("__file__", "")
-    if module_file:
-        candidates.append(os.path.dirname(os.path.abspath(module_file)))
-
-    space_data = getattr(bpy.context, "space_data", None)
-    text = getattr(space_data, "text", None)
-    text_filepath = getattr(text, "filepath", "") if text is not None else ""
-    if text_filepath:
-        candidates.append(os.path.dirname(os.path.abspath(text_filepath)))
-
-    candidates.append(os.getcwd())
-
-    for candidate in candidates:
-        if os.path.exists(os.path.join(candidate, "bool_tool_v2.0.0", "__init__.py")):
-            return candidate
-
-    return candidates[0] if candidates else os.getcwd()
-
-
-def get_embedded_bool_tool_directory():
-    return os.path.join(get_miniature_voxeler_directory(), "bool_tool_v2.0.0")
-
-
-def load_embedded_bool_tool_package():
-    module = sys.modules.get(EMBEDDED_BOOL_TOOL_PACKAGE)
-    if module is not None:
-        return module
-
-    bool_tool_dir = get_embedded_bool_tool_directory()
-    init_path = os.path.join(bool_tool_dir, "__init__.py")
-    if not os.path.exists(init_path):
-        raise FileNotFoundError(f"Embedded Bool Tool not found: {init_path}")
-
-    spec = importlib.util.spec_from_file_location(
-        EMBEDDED_BOOL_TOOL_PACKAGE,
-        init_path,
-        submodule_search_locations=[bool_tool_dir],
-    )
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[EMBEDDED_BOOL_TOOL_PACKAGE] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def register_embedded_bool_tool():
-    global _embedded_bool_tool_error, _embedded_bool_tool_modules
-    _embedded_bool_tool_error = ""
-
-    try:
-        load_embedded_bool_tool_package()
-        modules = [
-            importlib.import_module(f"{EMBEDDED_BOOL_TOOL_PACKAGE}.properties"),
-            importlib.import_module(f"{EMBEDDED_BOOL_TOOL_PACKAGE}.operators"),
-        ]
-        registered_modules = []
-        _embedded_bool_tool_modules = registered_modules
-        for module in modules:
-            try:
-                module.unregister()
-            except Exception:
-                pass
-            module.register()
-            registered_modules.append(module)
-    except Exception as error:
-        unregister_embedded_bool_tool()
-        _embedded_bool_tool_error = f"Embedded Bool Tool failed: {error}"
-        print(f"Miniature Voxeler: {_embedded_bool_tool_error}")
-
-
-def unregister_embedded_bool_tool():
-    global _embedded_bool_tool_modules
-
-    for module in reversed(_embedded_bool_tool_modules):
-        try:
-            module.unregister()
-        except Exception as error:
-            print(f"Miniature Voxeler: embedded Bool Tool unregister failed: {error}")
-    _embedded_bool_tool_modules = []
-
-
 def register():
-    unregister_embedded_bool_tool()
     if hasattr(bpy.types.Scene, "miniature_voxeler_settings"):
         del bpy.types.Scene.miniature_voxeler_settings
     for cls in reversed(classes):
@@ -5252,11 +5586,9 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.miniature_voxeler_settings = PointerProperty(type=MINIATUREVOXELER_PG_settings)
-    register_embedded_bool_tool()
 
 
 def unregister():
-    unregister_embedded_bool_tool()
     del bpy.types.Scene.miniature_voxeler_settings
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
