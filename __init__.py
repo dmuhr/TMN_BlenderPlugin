@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Miniature Voxeler",
     "author": "OpenAI",
-    "version": (3, 3, 1),
+    "version": (3, 10, 1),
     "blender": (5, 0, 1),
     "location": "3D View > Sidebar > Miniature Voxeler",
     "description": "Block remesh, transfer texture, create Lego-color face materials, and generate Lego skin meshes for miniature voxel workflows",
@@ -27,7 +27,7 @@ from bpy.props import (
     EnumProperty,
 )
 
-ADDON_VERSION_TEXT = "v.3.3.1"
+ADDON_VERSION_TEXT = "v.3.10.1"
 
 
 def srgb_channel_to_linear(value):
@@ -192,6 +192,16 @@ def update_color_skin_base_slot(settings, context):
 def update_lego_color_count(settings, context):
     if settings.selected_lego_palette_slot >= settings.lego_color_count:
         settings.selected_lego_palette_slot = settings.lego_color_count - 1
+
+
+def get_source_validation_key(building_obj, platform_obj):
+    if building_obj is None or platform_obj is None:
+        return ""
+    return f"{building_obj.name}|{platform_obj.name}"
+
+
+def source_pair_is_validated(settings, building_obj, platform_obj):
+    return settings.source_validation_key == get_source_validation_key(building_obj, platform_obj)
 
 
 def get_building_object(settings):
@@ -625,6 +635,13 @@ def ensure_face_int_attribute(mesh, name, values):
     attribute.data.foreach_set("value", values)
 
 
+def get_face_int_attribute_values(mesh, name, default_value=0):
+    attribute = mesh.attributes.get(name)
+    if attribute is None or len(attribute.data) != len(mesh.polygons):
+        return [default_value] * len(mesh.polygons)
+    return [int(item.value) for item in attribute.data]
+
+
 def rebuild_voxel_mesh_from_cells(obj, origin, voxel_size, cells):
     directions = [
         ((1, 0, 0), ((1, 0, 0), (1, 0, 1), (1, 1, 1), (1, 1, 0))),
@@ -787,8 +804,6 @@ def generate_voxel_cells_from_object(context, source_obj, settings):
         max(1, int((bbox_max.z - bbox_min.z) / voxel_size) + 3),
     )
     diagonal = (bbox_max - bbox_min).length + (voxel_size * 4.0)
-    keepout = get_platform_keepout_data(settings)
-    z_floor = bbox_min.z - voxel_size
     cells = {}
 
     for i in range(counts[0]):
@@ -798,8 +813,6 @@ def generate_voxel_cells_from_object(context, source_obj, settings):
             for k in range(counts[2]):
                 z = origin.z + ((k + 0.5) * voxel_size)
                 center = Vector((x, y, z))
-                if keepout is not None and cell_intersects_top_loop_keepout(center, voxel_size, keepout, z_floor):
-                    continue
                 if not is_point_inside_evaluated_mesh(source_eval, center, diagonal):
                     continue
                 cells[(i, j, k)] = 0
@@ -902,6 +915,13 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
         poll=lambda self, obj: obj is not None and obj.type == 'MESH',
     )
 
+    source_validation_key: StringProperty(
+        name="Source Validation Key",
+        description="Internal marker for the Building/Platform pair that passed transform and size validation",
+        default="",
+        options={'HIDDEN'},
+    )
+
     show_platform_steps: BoolProperty(
         name="---- PLATFORM ----",
         description="Show or hide the platform workflow steps",
@@ -952,7 +972,7 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
 
     platform_limited_dissolve_angle: FloatProperty(
         name="Max Angle",
-        description="Maximum angle used by Limited Dissolve on the platform copy",
+        description="Maximum angle used by Limited Dissolve on the hole selection mesh",
         subtype='ANGLE',
         default=radians(5.0),
         min=0.0,
@@ -1201,6 +1221,22 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
         unit='LENGTH',
     )
 
+    platform_bridge_vertex_distance_mm: FloatProperty(
+        name="New Vertex Distance",
+        description="Target spacing for new vertices inserted along bridged ring edges",
+        default=3.0,
+        min=0.001,
+        precision=3,
+    )
+
+    platform_fill_subdivide_cuts: IntProperty(
+        name="Fill Cuts",
+        description="Number of cuts used when subdividing the Beauty Fill faces for sculpt smoothing",
+        default=2,
+        min=1,
+        max=20,
+    )
+
     platform_inner_thickness_mm: FloatProperty(
         name="Inner Thickness (mm)",
         description="Inward 2D cutter thickness from the stored upper loop",
@@ -1280,6 +1316,8 @@ def duplicate_object(context, source_obj, new_name):
 
 
 def set_active_object(context, obj):
+    if context.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')
     bpy.ops.object.select_all(action='DESELECT')
     obj.select_set(True)
     context.view_layer.objects.active = obj
@@ -1287,6 +1325,8 @@ def set_active_object(context, obj):
 
 def get_root_name(obj_name):
     if obj_name.endswith("_copy"):
+        return obj_name[:-5]
+    if obj_name.endswith("_body"):
         return obj_name[:-5]
     if "_Blocks_Skin_" in obj_name:
         return obj_name.split("_Blocks_Skin_")[0]
@@ -1298,6 +1338,10 @@ def get_root_name(obj_name):
         return obj_name[:-12]
     if obj_name.endswith("_Building_Cutter"):
         return obj_name[:-16]
+    if obj_name.endswith("_Rings"):
+        return obj_name[:-6]
+    if obj_name.endswith("_HoleSelection"):
+        return obj_name[:-14]
     if "_Cutter_" in obj_name:
         return obj_name.split("_Cutter_")[0]
     if obj_name.endswith("_Cutter"):
@@ -1318,7 +1362,7 @@ def get_blocks_name(root_name):
 
 
 def get_building_copy_name(root_name):
-    return f"{root_name}_copy"
+    return f"{root_name}_body"
 
 
 def get_base_name(root_name):
@@ -1337,15 +1381,15 @@ def get_color_skin_name(root_name, slot_index, island_index=None):
 
 
 def get_platform_copy_name(platform_name):
-    return f"{platform_name}_Platform_Copy"
+    return f"{platform_name}_HoleSelection"
 
 
 def get_platform_walls_name(platform_name):
-    return f"{platform_name}_Building_Cutter"
+    return f"{platform_name}_Rings"
 
 
 def get_platform_building_cutter_name(platform_name):
-    return f"{platform_name}_Building_Cutter"
+    return f"{platform_name}_Rings"
 
 
 def get_platform_missing_walls_name(platform_name):
@@ -2722,6 +2766,74 @@ def resolve_selected_edge_rings(obj, edge_indices, gap_tolerance):
     return rings, bridged_total, messages
 
 
+def get_selected_edge_index_groups_from_mesh(mesh, edge_indices):
+    selected_edge_set = set(edge_indices)
+    edge_to_verts = {
+        edge.index: tuple(edge.vertices)
+        for edge in mesh.edges
+        if edge.index in selected_edge_set
+    }
+    vert_to_edges = {}
+    for edge_index, vertices in edge_to_verts.items():
+        for vertex_index in vertices:
+            vert_to_edges.setdefault(vertex_index, []).append(edge_index)
+
+    groups = []
+    visited = set()
+    for edge_index in edge_to_verts:
+        if edge_index in visited:
+            continue
+        stack = [edge_index]
+        group = []
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            group.append(current)
+            for vertex_index in edge_to_verts[current]:
+                for linked_edge_index in vert_to_edges.get(vertex_index, []):
+                    if linked_edge_index not in visited:
+                        stack.append(linked_edge_index)
+        if group:
+            groups.append(group)
+    return groups
+
+
+def resolve_selected_edge_rings_relaxed(obj, edge_indices):
+    rings = []
+    for edge_group in get_selected_edge_index_groups_from_mesh(obj.data, edge_indices):
+        coords = get_ordered_loop_coords(obj, edge_group)
+        if len(coords) >= 3 and loop_edges_form_closed_boundary(obj.data, edge_group):
+            rings.append(coords)
+    return rings
+
+
+def loop_edges_form_closed_boundary(mesh, edge_indices):
+    vert_degrees = {}
+    valid_edge_count = 0
+    for edge_index in edge_indices:
+        if edge_index < 0 or edge_index >= len(mesh.edges):
+            continue
+        valid_edge_count += 1
+        for vertex_index in mesh.edges[edge_index].vertices:
+            vert_degrees[vertex_index] = vert_degrees.get(vertex_index, 0) + 1
+    return valid_edge_count >= 3 and vert_degrees and all(degree == 2 for degree in vert_degrees.values())
+
+
+def clear_stored_platform_rings_data(obj):
+    for key in ("mv_platform_top_rings_json", "mv_platform_top_ring", "mv_platform_lower_z"):
+        if key in obj:
+            del obj[key]
+
+
+def resolve_all_edge_rings(obj, gap_tolerance=0.0):
+    edge_indices = [edge.index for edge in obj.data.edges]
+    if not edge_indices:
+        return [], 0, ["rings object has no edges"]
+    return resolve_selected_edge_rings(obj, edge_indices, gap_tolerance)
+
+
 def rebuild_tube_from_top_loop(obj, top_edge_indices, target_bottom_z, top_up_distance, bottom_down_distance=0.0):
     loop_coords = get_ordered_loop_coords(obj, top_edge_indices)
     if len(loop_coords) < 3:
@@ -2800,6 +2912,164 @@ def set_mesh_to_rings(obj, rings):
     obj.data.clear_geometry()
     obj.data.from_pydata(verts, edges, [])
     obj.data.update()
+
+
+def enable_view3d_xray(context):
+    screen = getattr(context, "screen", None)
+    if screen is None:
+        return
+    for area in screen.areas:
+        if area.type != 'VIEW_3D':
+            continue
+        for space in area.spaces:
+            if space.type != 'VIEW_3D':
+                continue
+            if hasattr(space.shading, "show_xray"):
+                space.shading.show_xray = True
+            if hasattr(space.shading, "show_xray_wireframe"):
+                space.shading.show_xray_wireframe = True
+
+
+def select_lasso_tool():
+    try:
+        bpy.ops.wm.tool_set_by_id(name="builtin.select_lasso")
+    except Exception:
+        pass
+
+
+def get_selected_vertex_world_coords(context):
+    source_obj = context.edit_object if context.mode == 'EDIT_MESH' else context.object
+    if source_obj is None or source_obj.type != 'MESH':
+        return None, []
+
+    coords = []
+    if context.mode == 'EDIT_MESH' and context.edit_object == source_obj:
+        bm = bmesh.from_edit_mesh(source_obj.data)
+        bm.verts.ensure_lookup_table()
+        coords = [source_obj.matrix_world @ vert.co for vert in bm.verts if vert.select]
+    else:
+        coords = [source_obj.matrix_world @ vert.co for vert in source_obj.data.vertices if vert.select]
+    return source_obj, coords
+
+
+def append_world_vertices_to_object(obj, world_coords):
+    if not world_coords:
+        return 0
+
+    if bpy.context.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+    local_coords = [obj.matrix_world.inverted() @ coord for coord in world_coords]
+    mesh = obj.data
+    old_vert_count = len(mesh.vertices)
+    verts = [vert.co.copy() for vert in mesh.vertices] + local_coords
+    edges = [tuple(edge.vertices) for edge in mesh.edges]
+    faces = [tuple(poly.vertices) for poly in mesh.polygons]
+
+    mesh.clear_geometry()
+    mesh.from_pydata([tuple(vert) for vert in verts], edges, faces)
+    mesh.update(calc_edges=True)
+
+    for vertex in mesh.vertices:
+        vertex.select = vertex.index >= old_vert_count
+    for edge in mesh.edges:
+        edge.select = False
+    for poly in mesh.polygons:
+        poly.select = False
+    mesh.update()
+    clear_stored_platform_rings_data(obj)
+    return len(local_coords)
+
+
+def bridge_selected_vertices_on_object(obj, max_segment_length):
+    bm = bmesh.from_edit_mesh(obj.data)
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+
+    selected_verts = [vert for vert in bm.verts if vert.select]
+    if len(selected_verts) < 2 or len(selected_verts) % 2 != 0:
+        return None
+
+    existing_edges = {frozenset(edge.verts) for edge in bm.edges}
+    created_count = 0
+    created_vertex_count = 0
+    created_edges = []
+    selected_verts.sort(key=lambda vert: vert.index)
+    for index in range(0, len(selected_verts), 2):
+        vert_a = selected_verts[index]
+        vert_b = selected_verts[index + 1]
+        segment = vert_b.co - vert_a.co
+        length = segment.length
+        segment_count = 1
+        if max_segment_length > 0.0 and length > max_segment_length:
+            segment_count = max(1, int(length / max_segment_length + 0.999999))
+
+        chain = [vert_a]
+        for segment_index in range(1, segment_count):
+            t = segment_index / segment_count
+            new_vert = bm.verts.new(vert_a.co.lerp(vert_b.co, t))
+            chain.append(new_vert)
+            created_vertex_count += 1
+        chain.append(vert_b)
+        bm.verts.ensure_lookup_table()
+
+        for chain_index in range(len(chain) - 1):
+            edge_a = chain[chain_index]
+            edge_b = chain[chain_index + 1]
+            key = frozenset((edge_a, edge_b))
+            if key in existing_edges:
+                continue
+            try:
+                new_edge = bm.edges.new((edge_a, edge_b))
+                new_edge.select = True
+                created_edges.append(new_edge)
+                existing_edges.add(key)
+                created_count += 1
+            except ValueError:
+                pass
+
+    for vert in bm.verts:
+        vert.select = False
+    for edge in bm.edges:
+        edge.select = edge in created_edges
+    bm.select_flush_mode()
+    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+    clear_stored_platform_rings_data(obj)
+    return created_count, created_vertex_count
+
+
+def isolate_selected_edges_to_object(obj):
+    bm = bmesh.from_edit_mesh(obj.data)
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    selected_edges = [edge for edge in bm.edges if edge.select]
+    if not selected_edges:
+        return 0, 0
+
+    selected_vert_indices = []
+    for edge in selected_edges:
+        for vert in edge.verts:
+            if vert.index not in selected_vert_indices:
+                selected_vert_indices.append(vert.index)
+
+    index_map = {old_index: new_index for new_index, old_index in enumerate(selected_vert_indices)}
+    verts = [tuple(bm.verts[old_index].co) for old_index in selected_vert_indices]
+    edges = [
+        (index_map[edge.verts[0].index], index_map[edge.verts[1].index])
+        for edge in selected_edges
+    ]
+
+    bpy.ops.object.mode_set(mode='OBJECT')
+    obj.data.clear_geometry()
+    obj.data.from_pydata(verts, edges, [])
+    obj.data.update(calc_edges=True)
+    for edge in obj.data.edges:
+        edge.select = True
+    for vertex in obj.data.vertices:
+        vertex.select = True
+    obj.data.update()
+    clear_stored_platform_rings_data(obj)
+    return len(verts), len(edges)
 
 
 def store_platform_ring_data(obj, top_coords, lower_z=None):
@@ -2949,7 +3219,7 @@ def build_2d_cutter_mesh(obj, source_coords, inner_distance, outer_distance):
     return build_2d_cutter_mesh_from_rings(obj, [source_coords], inner_distance, outer_distance)
 
 
-def append_2d_cutter_ring_geometry(verts, faces, source_coords, inner_distance, outer_distance):
+def append_2d_cutter_ring_geometry(verts, faces, editable_faces, source_coords, inner_distance, outer_distance):
     inner, outer = offset_ring_coords(source_coords, inner_distance + outer_distance, 0.0)
     if len(inner) < 3 or len(outer) < 3:
         return 0
@@ -2965,6 +3235,7 @@ def append_2d_cutter_ring_geometry(verts, faces, source_coords, inner_distance, 
 
     for index in range(count):
         next_index = (index + 1) % count
+        editable_faces.append(len(faces))
         faces.append((
             start_index + index,
             start_index + next_index,
@@ -2983,11 +3254,13 @@ def append_2d_cutter_ring_geometry(verts, faces, source_coords, inner_distance, 
 def build_2d_cutter_mesh_from_rings(obj, rings, inner_distance, outer_distance):
     verts = []
     faces = []
+    editable_faces = []
     total_count = 0
     for source_coords in rings:
         total_count += append_2d_cutter_ring_geometry(
             verts,
             faces,
+            editable_faces,
             source_coords,
             inner_distance,
             outer_distance,
@@ -2996,6 +3269,7 @@ def build_2d_cutter_mesh_from_rings(obj, rings, inner_distance, outer_distance):
     obj.data.clear_geometry()
     obj.data.from_pydata(verts, [], faces)
     obj.data.update()
+    tag_platform_fill_faces(obj, editable_faces, preserve_existing=False)
     return total_count
 
 
@@ -3058,6 +3332,137 @@ def close_2d_cutter_inner_loop(context, obj):
     return close_2d_cutter_inner_loops(context, obj)
 
 
+def tag_platform_fill_faces(obj, fill_face_indices, preserve_existing=True):
+    fill_set = set(fill_face_indices)
+    values = get_face_int_attribute_values(obj.data, "mv_platform_fill_face", 0) if preserve_existing else [0] * len(obj.data.polygons)
+    for poly in obj.data.polygons:
+        if poly.index in fill_set:
+            values[poly.index] = 1
+    ensure_face_int_attribute(obj.data, "mv_platform_fill_face", values)
+    obj.data.update()
+
+
+def update_platform_fill_tag_from_selected_faces(obj):
+    values = get_face_int_attribute_values(obj.data, "mv_platform_fill_face", 0)
+    selected_count = 0
+    for poly in obj.data.polygons:
+        if poly.select:
+            values[poly.index] = 1
+            selected_count += 1
+    ensure_face_int_attribute(obj.data, "mv_platform_fill_face", values)
+    obj.data.update()
+    return selected_count
+
+
+def select_platform_fill_faces(context, obj, invert=False):
+    if context.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+    values = get_face_int_attribute_values(obj.data, "mv_platform_fill_face", 0)
+    selected_count = 0
+    for poly in obj.data.polygons:
+        should_select = values[poly.index] == 1
+        if invert:
+            should_select = not should_select
+        poly.select = should_select
+        if should_select:
+            selected_count += 1
+
+    obj.data.update()
+    set_active_object(context, obj)
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_mode(type='FACE')
+    return selected_count
+
+
+def assign_sculpt_face_sets_for_platform_fill(obj):
+    values = get_face_int_attribute_values(obj.data, "mv_platform_fill_face", 0)
+    face_set_values = [1 if value == 1 else 2 for value in values]
+    ensure_face_int_attribute(obj.data, ".sculpt_face_set", face_set_values)
+    obj.data.update()
+
+
+def create_sculpt_face_set_from_current_selection(context):
+    if context.mode != 'SCULPT':
+        bpy.ops.object.mode_set(mode='SCULPT')
+
+    for mode_name in ('SELECTION', 'EDIT_SELECTION'):
+        try:
+            bpy.ops.sculpt.face_sets_create(mode=mode_name)
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def enable_sculpt_face_set_automasking(context):
+    sculpt_settings = getattr(context.tool_settings, "sculpt", None)
+    if sculpt_settings is None:
+        return False
+
+    face_set_attrs = (
+        "use_automasking_face_sets",
+    )
+    boundary_attrs = (
+        "use_automasking_boundary_face_sets",
+        "use_automasking_face_sets_boundary",
+    )
+    automasking_attrs = face_set_attrs + boundary_attrs
+    enabled = False
+    for attr_name in automasking_attrs:
+        if hasattr(sculpt_settings, attr_name):
+            setattr(sculpt_settings, attr_name, True)
+            enabled = True
+    brush = getattr(sculpt_settings, "brush", None)
+    if brush is not None:
+        for attr_name in automasking_attrs:
+            if hasattr(brush, attr_name):
+                setattr(brush, attr_name, True)
+                enabled = True
+    return enabled
+
+
+SCULPT_BRUSH_TOOL_IDS = {
+    'SMOOTH': ("builtin_brush.Smooth", "builtin_brush.smooth"),
+    'GRAB': ("builtin_brush.Grab", "builtin_brush.grab"),
+    'FLATTEN_CONTRAST': (
+        "builtin_brush.Flatten",
+        "builtin_brush.flatten",
+        "builtin_brush.FlattenContrast",
+        "builtin_brush.flatten_contrast",
+    ),
+    'RELAX_PINCH': (
+        "builtin_brush.Relax",
+        "builtin_brush.relax",
+        "builtin_brush.RelaxPinch",
+        "builtin_brush.relax_pinch",
+        "builtin_brush.Relax_Pinch",
+    ),
+}
+
+SCULPT_BRUSH_LABELS = {
+    'SMOOTH': "Smooth",
+    'GRAB': "Grab",
+    'FLATTEN_CONTRAST': "Flatten/Contrast",
+    'RELAX_PINCH': "Relax Pinch",
+}
+
+
+def select_sculpt_brush_tool(context, brush_type):
+    if context.mode != 'SCULPT':
+        bpy.ops.object.mode_set(mode='SCULPT')
+
+    enable_sculpt_face_set_automasking(context)
+    for tool_name in SCULPT_BRUSH_TOOL_IDS.get(brush_type, ()):
+        try:
+            bpy.ops.wm.tool_set_by_id(name=tool_name)
+            enable_sculpt_face_set_automasking(context)
+            return True
+        except Exception:
+            pass
+    return False
+
+
 def close_2d_cutter_inner_loops(context, obj):
     mesh = obj.data
     loops = get_boundary_edge_loops_from_mesh(mesh)
@@ -3101,6 +3506,7 @@ def close_2d_cutter_inner_loops(context, obj):
         inner_loops = [min(loops, key=loop_area)]
 
     face_count_before = len(mesh.polygons)
+    editable_values_before_fill = get_face_int_attribute_values(mesh, "mv_platform_fill_face", 0)
 
     # This is the scripted equivalent of selecting inner loops and pressing
     # Alt+F with Beauty enabled in Blender's Fill operator.
@@ -3126,6 +3532,17 @@ def close_2d_cutter_inner_loops(context, obj):
         bpy.ops.mesh.fill()
 
     bpy.ops.object.mode_set(mode='OBJECT')
+    new_face_indices = [
+        poly.index for poly in mesh.polygons
+        if poly.index >= face_count_before
+    ]
+    editable_values = editable_values_before_fill + [0] * max(0, len(mesh.polygons) - len(editable_values_before_fill))
+    for face_index in new_face_indices:
+        editable_values[face_index] = 1
+    ensure_face_int_attribute(mesh, "mv_platform_fill_face", editable_values)
+    mesh.update()
+    select_platform_fill_faces(context, obj)
+
     closed_vertex_count = sum(len(loop) for loop in inner_loops)
     return closed_vertex_count, max(0, len(mesh.polygons) - face_count_before)
 
@@ -4014,12 +4431,16 @@ class MINIATUREVOXELER_OT_apply_all_transforms(Operator):
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
 
+        context.scene.unit_settings.system = 'METRIC'
+        context.scene.unit_settings.length_unit = 'MILLIMETERS'
+
         for obj in (building_obj, platform_obj):
             set_active_object(context, obj)
             bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
 
         warnings = get_source_scale_warnings(context, building_obj, platform_obj)
         if warnings:
+            settings.source_validation_key = ""
             show_info_popup(
                 context,
                 "Check Source Scale",
@@ -4029,6 +4450,7 @@ class MINIATUREVOXELER_OT_apply_all_transforms(Operator):
             self.report({'WARNING'}, "Applied transforms, but source scale looks wrong. Check the warning popup.")
             return {'FINISHED'}
 
+        settings.source_validation_key = get_source_validation_key(building_obj, platform_obj)
         self.report({'INFO'}, f"Applied all transforms to {building_obj.name} and {platform_obj.name}.")
         return {'FINISHED'}
 
@@ -4155,12 +4577,8 @@ class MINIATUREVOXELER_OT_transfer_texture(Operator):
         scene = context.scene
         old_engine = scene.render.engine
         should_rehide_source = (building_obj is not None and source_obj == building_obj)
-        was_source_hidden = source_obj.hide_get() if should_rehide_source else False
 
         try:
-            if should_rehide_source:
-                source_obj.hide_set(False)
-
             scene.render.engine = 'CYCLES'
 
             bake = scene.render.bake
@@ -4192,7 +4610,7 @@ class MINIATUREVOXELER_OT_transfer_texture(Operator):
 
         except Exception as e:
             if should_rehide_source:
-                source_obj.hide_set(was_source_hidden)
+                source_obj.hide_set(True)
             scene.render.engine = old_engine
             self.report({'ERROR'}, f"Texture transfer failed: {str(e)}")
             return {'CANCELLED'}
@@ -4853,17 +5271,24 @@ class MINIATUREVOXELER_OT_generate_color_skin(Operator):
 
 
 # ------------------------------------------------------------
-# Operator 9: Prepare Platform Copy
+# Operator 9: Prepare Hole Selection Mesh
 # ------------------------------------------------------------
 
 class MINIATUREVOXELER_OT_prepare_platform_copy(Operator):
     bl_idname = "object.miniature_voxeler_prepare_platform_copy"
-    bl_label = "Prepare Platform Copy"
+    bl_label = "Prepare Hole Selection"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
-        return has_building_object(context) and get_platform_object(context.scene.miniature_voxeler_settings) is not None
+        settings = context.scene.miniature_voxeler_settings
+        building_obj = get_building_object(settings)
+        platform_obj = get_platform_object(settings)
+        return (
+            building_obj is not None and
+            platform_obj is not None and
+            source_pair_is_validated(settings, building_obj, platform_obj)
+        )
 
     def execute(self, context):
         settings = context.scene.miniature_voxeler_settings
@@ -4871,6 +5296,9 @@ class MINIATUREVOXELER_OT_prepare_platform_copy(Operator):
         platform_obj = get_platform_object(settings)
         if building_obj is None or platform_obj is None:
             self.report({'ERROR'}, "Pick both a Building and Platform mesh first.")
+            return {'CANCELLED'}
+        if not source_pair_is_validated(settings, building_obj, platform_obj):
+            self.report({'ERROR'}, "Apply transforms and resolve source scale warnings before creating the hole selection mesh.")
             return {'CANCELLED'}
 
         if context.mode != 'OBJECT':
@@ -4913,7 +5341,7 @@ class MINIATUREVOXELER_OT_prepare_platform_walls_selection(Operator):
         settings = context.scene.miniature_voxeler_settings
         obj = get_platform_copy_object(settings)
         if obj is None:
-            self.report({'ERROR'}, "Run Step 1.1 first so the platform copy exists.")
+            self.report({'ERROR'}, "Run Step 1.1 first so the hole selection mesh exists.")
             return {'CANCELLED'}
 
         # Step 1.2 begins in Face select because the existing hole walls are already real faces.
@@ -4940,7 +5368,7 @@ class MINIATUREVOXELER_OT_separate_platform_walls(Operator):
         building_obj = get_building_object(settings)
         platform_copy = get_platform_copy_object(settings)
         if building_obj is None or platform_copy is None:
-            self.report({'ERROR'}, "Run Step 1.1 first so the platform copy exists.")
+            self.report({'ERROR'}, "Run Step 1.1 first so the hole selection mesh exists.")
             return {'CANCELLED'}
 
         if context.mode != 'EDIT_MESH':
@@ -4955,7 +5383,7 @@ class MINIATUREVOXELER_OT_separate_platform_walls(Operator):
         bm.faces.ensure_lookup_table()
         selected_count = sum(1 for face in bm.faces if face.select)
         if selected_count == 0:
-            self.report({'ERROR'}, "Select at least one face in the platform copy before separating.")
+            self.report({'ERROR'}, "Select at least one face in the hole selection mesh before separating.")
             return {'CANCELLED'}
 
         platform_obj = get_platform_object(settings)
@@ -4964,21 +5392,21 @@ class MINIATUREVOXELER_OT_separate_platform_walls(Operator):
         if existing_walls is not None:
             remove_object_if_exists(existing_walls)
 
-        # Separate selected faces into the cutter object, but keep the copy alive for Step 1.3 edge selection.
+        # Separate selected faces into the rings object, but keep the hole selection mesh alive for Step 1.3 edge selection.
         pre_names = set(obj.name for obj in bpy.data.objects)
         bpy.ops.mesh.separate(type='SELECTED')
         bpy.ops.object.mode_set(mode='OBJECT')
 
         new_obj = find_new_object(pre_names, platform_copy, context)
         if new_obj is None:
-            self.report({'ERROR'}, "Could not identify the separated cutter object.")
+            self.report({'ERROR'}, "Could not identify the separated rings object.")
             return {'CANCELLED'}
 
         new_obj.name = get_platform_walls_name(platform_name)
         set_metadata(new_obj, get_root_name(building_obj.name), platform_copy.name)
         set_active_object(context, platform_copy)
 
-        self.report({'INFO'}, f"Separated {selected_count} wall face(s) into {new_obj.name}. Platform copy is still available for missing-wall edge selection.")
+        self.report({'INFO'}, f"Separated {selected_count} wall face(s) into {new_obj.name}. Hole selection mesh is still available for missing-wall edge selection.")
         return {'FINISHED'}
 
 
@@ -4995,7 +5423,7 @@ class MINIATUREVOXELER_OT_prepare_platform_missing_walls_selection(Operator):
         settings = context.scene.miniature_voxeler_settings
         obj = get_platform_copy_object(settings)
         if obj is None:
-            self.report({'ERROR'}, "Create the editable platform copy first.")
+            self.report({'ERROR'}, "Create the hole selection mesh first.")
             return {'CANCELLED'}
 
         set_active_object(context, obj)
@@ -5022,7 +5450,7 @@ class MINIATUREVOXELER_OT_separate_platform_missing_walls(Operator):
         platform_copy = get_platform_copy_object(settings)
         platform_obj = get_platform_object(settings)
         if building_obj is None or platform_copy is None or platform_obj is None:
-            self.report({'ERROR'}, "Pick sources and create the editable platform copy first.")
+            self.report({'ERROR'}, "Pick sources and create the hole selection mesh first.")
             return {'CANCELLED'}
 
         if context.mode != 'EDIT_MESH':
@@ -5104,6 +5532,131 @@ class MINIATUREVOXELER_OT_build_platform_missing_walls(Operator):
         return {'FINISHED'}
 
 
+class MINIATUREVOXELER_OT_add_vertex_to_rings(Operator):
+    bl_idname = "object.mv_platform_add_vertex_to_rings"
+    bl_label = "Add Vertex To Rings"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        settings = getattr(context.scene, "miniature_voxeler_settings", None)
+        return settings is not None and get_platform_walls_object(settings) is not None
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        rings_obj = get_platform_walls_object(settings)
+        source_obj, world_coords = get_selected_vertex_world_coords(context)
+        if rings_obj is None:
+            self.report({'ERROR'}, "Separate hole walls first so the rings object exists.")
+            return {'CANCELLED'}
+        if source_obj is None or not world_coords:
+            self.report({'ERROR'}, "Select one or more source vertices to copy into the rings object.")
+            return {'CANCELLED'}
+
+        added_count = append_world_vertices_to_object(rings_obj, world_coords)
+        set_active_object(context, rings_obj)
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_mode(type='VERT')
+        self.report({'INFO'}, f"Copied {added_count} selected vertex/vertices from {source_obj.name} into {rings_obj.name}.")
+        return {'FINISHED'}
+
+
+class MINIATUREVOXELER_OT_bridge_rings_vertices(Operator):
+    bl_idname = "object.mv_platform_bridge_rings_vertices"
+    bl_label = "Bridge Rings Vertices"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        settings = getattr(context.scene, "miniature_voxeler_settings", None)
+        return settings is not None and get_platform_walls_object(settings) is not None
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        rings_obj = get_platform_walls_object(settings)
+        if rings_obj is None:
+            self.report({'ERROR'}, "Separate hole walls first so the rings object exists.")
+            return {'CANCELLED'}
+
+        if context.mode != 'EDIT_MESH' or context.edit_object != rings_obj:
+            set_active_object(context, rings_obj)
+            bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_mode(type='VERT')
+
+        max_segment_length = mm_to_scene_units(context, settings.platform_bridge_vertex_distance_mm)
+        bridge_result = bridge_selected_vertices_on_object(rings_obj, max_segment_length)
+        if bridge_result is None:
+            self.report({'ERROR'}, "Select two vertices, or an even number of vertices, on the rings object.")
+            return {'CANCELLED'}
+        created_count, created_vertex_count = bridge_result
+        self.report({'INFO'}, f"Created {created_count} bridge edge(s) and {created_vertex_count} new vertex/vertices on {rings_obj.name}.")
+        return {'FINISHED'}
+
+
+class MINIATUREVOXELER_OT_select_platform_upper_ring(Operator):
+    bl_idname = "object.mv_platform_select_upper_ring"
+    bl_label = "Select Upper Ring"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        settings = getattr(context.scene, "miniature_voxeler_settings", None)
+        return settings is not None and get_platform_walls_object(settings) is not None
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        rings_obj = get_platform_walls_object(settings)
+        if rings_obj is None:
+            self.report({'ERROR'}, "Separate hole walls first so the rings object exists.")
+            return {'CANCELLED'}
+
+        set_active_object(context, rings_obj)
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_mode(type='EDGE')
+        select_lasso_tool()
+        enable_view3d_xray(context)
+        self.report({'INFO'}, f"{rings_obj.name} is ready for lasso-selecting upper ring edges with X-Ray enabled.")
+        return {'FINISHED'}
+
+
+class MINIATUREVOXELER_OT_isolate_platform_upper_ring(Operator):
+    bl_idname = "object.mv_platform_isolate_upper_ring"
+    bl_label = "Isolate Upper Ring"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        settings = getattr(context.scene, "miniature_voxeler_settings", None)
+        return settings is not None and get_platform_walls_object(settings) is not None
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        rings_obj = get_platform_walls_object(settings)
+        if rings_obj is None:
+            self.report({'ERROR'}, "Separate hole walls first so the rings object exists.")
+            return {'CANCELLED'}
+
+        if context.mode != 'EDIT_MESH' or context.edit_object != rings_obj:
+            set_active_object(context, rings_obj)
+            bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_mode(type='EDGE')
+
+        vert_count, edge_count = isolate_selected_edges_to_object(rings_obj)
+        if edge_count == 0:
+            self.report({'ERROR'}, "Select upper ring edges before isolating.")
+            return {'CANCELLED'}
+
+        hole_selection_obj = get_platform_copy_object(settings)
+        removed_hole_selection = hole_selection_obj is not None
+        remove_object_if_exists(hole_selection_obj)
+
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_mode(type='EDGE')
+        cleanup_text = " Removed HoleSelection." if removed_hole_selection else ""
+        self.report({'INFO'}, f"Isolated upper ring selection: {edge_count} edge(s), {vert_count} vertex/vertices remain.{cleanup_text}")
+        return {'FINISHED'}
+
+
 # ------------------------------------------------------------
 # Operator 11: Clean Platform Cutter
 # ------------------------------------------------------------
@@ -5132,7 +5685,7 @@ class MINIATUREVOXELER_OT_merge_platform_walls_by_distance(Operator):
         active_obj = context.edit_object if context.mode == 'EDIT_MESH' else context.object
         obj = active_obj if active_obj in {walls_obj, foot_obj, building_cutter_obj} else walls_obj
         if obj is None:
-            self.report({'ERROR'}, "Create a 2D wall or foot mesh first.")
+            self.report({'ERROR'}, "Create the rings, 2D cutter, or foot mesh first.")
             return {'CANCELLED'}
 
         if context.mode != 'EDIT_MESH':
@@ -5150,6 +5703,7 @@ class MINIATUREVOXELER_OT_merge_platform_walls_by_distance(Operator):
             use_unselected=False,
             use_sharp_edge_from_normals=False,
         )
+        clear_stored_platform_rings_data(obj)
 
         self.report({'INFO'}, f"Ran Merge by Distance on {obj.name} with {settings.platform_merge_distance:.6f}.")
         return {'FINISHED'}
@@ -5172,7 +5726,7 @@ class MINIATUREVOXELER_OT_merge_platform_walls_at_center(Operator):
         if active_obj == obj:
             obj = active_obj
         if obj is None:
-            self.report({'ERROR'}, "Create the cutter first.")
+            self.report({'ERROR'}, "Create the rings object first.")
             return {'CANCELLED'}
 
         if context.mode != 'EDIT_MESH':
@@ -5192,6 +5746,7 @@ class MINIATUREVOXELER_OT_merge_platform_walls_at_center(Operator):
 
         bpy.ops.mesh.merge(type='CENTER')
         bpy.ops.mesh.select_all(action='DESELECT')
+        clear_stored_platform_rings_data(obj)
         self.report({'INFO'}, f"Merged {selected_count} selected vertices at center on {obj.name}.")
         return {'FINISHED'}
 
@@ -5213,7 +5768,7 @@ class MINIATUREVOXELER_OT_cleanup_platform_limited_dissolve(Operator):
         if active_obj == obj:
             obj = active_obj
         if obj is None:
-            self.report({'ERROR'}, "Create the cutter first.")
+            self.report({'ERROR'}, "Create the rings object first.")
             return {'CANCELLED'}
 
         if context.mode != 'EDIT_MESH':
@@ -5228,6 +5783,7 @@ class MINIATUREVOXELER_OT_cleanup_platform_limited_dissolve(Operator):
         bpy.ops.mesh.select_all(action='SELECT')
         bpy.ops.mesh.dissolve_limited(angle_limit=settings.platform_cleanup_dissolve_angle)
         bpy.ops.mesh.select_all(action='DESELECT')
+        clear_stored_platform_rings_data(obj)
 
         angle_deg = settings.platform_cleanup_dissolve_angle * 180.0 / pi
         self.report({'INFO'}, f"Ran Limited Dissolve on {obj.name} at {angle_deg:.3f} degrees.")
@@ -5240,7 +5796,7 @@ class MINIATUREVOXELER_OT_cleanup_platform_limited_dissolve(Operator):
 
 class MINIATUREVOXELER_OT_prepare_platform_wall_loop_selection(Operator):
     bl_idname = "object.mv_platform_wall_loop"
-    bl_label = "Store Upper Ring"
+    bl_label = "Store Rings"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -5255,7 +5811,7 @@ class MINIATUREVOXELER_OT_prepare_platform_wall_loop_selection(Operator):
         settings = context.scene.miniature_voxeler_settings
         obj = get_platform_walls_object(settings)
         if obj is None:
-            self.report({'ERROR'}, "Run Step 10 first so the cutter exists.")
+            self.report({'ERROR'}, "Separate hole walls first so the rings object exists.")
             return {'CANCELLED'}
         if context.mode != 'EDIT_MESH':
             set_active_object(context, obj)
@@ -5269,21 +5825,10 @@ class MINIATUREVOXELER_OT_prepare_platform_wall_loop_selection(Operator):
         bm = bmesh.from_edit_mesh(obj.data)
         bm.edges.ensure_lookup_table()
         selected_edges = [edge for edge in bm.edges if edge.select]
-        if not selected_edges:
-            show_info_popup(
-                context,
-                "Select Upper Ring",
-                [
-                    f"On {obj.name}, select the upper wall ring(s).",
-                    "You can select one upper edge per hole, or select each full upper loop.",
-                    "This deletes all wall geometry except the stored upper ring paths.",
-                ],
-                icon='EDGESEL',
-            )
-            self.report({'WARNING'}, "Select the upper ring first.")
-            return {'CANCELLED'}
-
-        if len(selected_edges) == 1:
+        using_all_edges = not selected_edges
+        if using_all_edges:
+            selected_edges = list(bm.edges)
+        elif len(selected_edges) == 1:
             select_connected_edge_loops_from_seeds(obj)
             bm = bmesh.from_edit_mesh(obj.data)
             bm.edges.ensure_lookup_table()
@@ -5291,7 +5836,7 @@ class MINIATUREVOXELER_OT_prepare_platform_wall_loop_selection(Operator):
 
         selected_edge_indices = [edge.index for edge in selected_edges]
         if not selected_edge_indices:
-            self.report({'ERROR'}, "Store Upper Ring needs at least one selected edge.")
+            self.report({'ERROR'}, "Store Rings needs selected edges or an isolated rings mesh with edges.")
             return {'CANCELLED'}
 
         bpy.ops.object.mode_set(mode='OBJECT')
@@ -5300,9 +5845,13 @@ class MINIATUREVOXELER_OT_prepare_platform_wall_loop_selection(Operator):
             selected_edge_indices,
             settings.platform_ring_gap_tolerance,
         )
+        used_relaxed_selection = False
         if not rings:
-            detail = messages[0] if messages else "selected edges do not form a closed boundary"
-            self.report({'ERROR'}, f"Could not resolve selected edge ring(s): {detail}. Increase Gap Tolerance or select missing edges.")
+            rings = resolve_selected_edge_rings_relaxed(obj, selected_edge_indices)
+            used_relaxed_selection = bool(rings)
+        if not rings:
+            detail = messages[0] if messages else "selected edges do not form a usable boundary"
+            self.report({'ERROR'}, f"Could not resolve ring edge(s): {detail}. Isolate the upper ring or select the full loop manually, then run Store Rings.")
             return {'CANCELLED'}
 
         store_platform_rings_data(obj, rings)
@@ -5311,7 +5860,41 @@ class MINIATUREVOXELER_OT_prepare_platform_wall_loop_selection(Operator):
 
         vertex_count = sum(len(coords) for coords in rings)
         gap_text = f", stitched {bridged_count} gap(s)" if bridged_count else ""
-        self.report({'INFO'}, f"Stored {len(rings)} upper ring(s) ({vertex_count} vertices{gap_text}) and deleted all other wall geometry.")
+        relaxed_text = ", used all isolated ring edges" if using_all_edges else (", used manual edge selection" if used_relaxed_selection else "")
+        self.report({'INFO'}, f"Stored {len(rings)} upper ring(s) ({vertex_count} vertices{gap_text}{relaxed_text}) and deleted all other wall geometry.")
+        return {'FINISHED'}
+
+
+class MINIATUREVOXELER_OT_select_platform_ring_loops(Operator):
+    bl_idname = "object.mv_platform_select_ring_loops"
+    bl_label = "Select Loops"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        settings = getattr(context.scene, "miniature_voxeler_settings", None)
+        return settings is not None and get_platform_walls_object(settings) is not None
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        obj = get_platform_walls_object(settings)
+        if obj is None:
+            self.report({'ERROR'}, "Separate or isolate rings first.")
+            return {'CANCELLED'}
+
+        if context.mode != 'EDIT_MESH' or context.edit_object != obj:
+            set_active_object(context, obj)
+            bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_mode(type='EDGE')
+
+        selected_count = select_connected_edge_loops_from_seeds(obj)
+        if selected_count == 0:
+            select_lasso_tool()
+            enable_view3d_xray(context)
+            self.report({'INFO'}, f"{obj.name} is in edge mode. Select seed edges or full loops, then run Store Rings.")
+            return {'FINISHED'}
+
+        self.report({'INFO'}, f"Expanded selected seed edges to {selected_count} connected ring edge(s).")
         return {'FINISHED'}
 
 
@@ -5333,11 +5916,20 @@ class MINIATUREVOXELER_OT_extrude_platform_walls_up(Operator):
 
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
-        rings, _ = get_stored_platform_rings_data(obj)
-        rings = [coords for coords in rings if len(coords) >= 3]
+        rings, bridged_count, messages = resolve_all_edge_rings(obj, 0.0)
+        if not rings and settings.platform_ring_gap_tolerance > 0.0:
+            rings, bridged_count, messages = resolve_all_edge_rings(obj, settings.platform_ring_gap_tolerance)
         if not rings:
-            self.report({'ERROR'}, "Run Store Upper Ring first.")
-            return {'CANCELLED'}
+            stored_rings, _ = get_stored_platform_rings_data(obj)
+            stored_rings = [coords for coords in stored_rings if len(coords) >= 3]
+            if stored_rings and not obj.data.edges:
+                rings = stored_rings
+            else:
+                detail = messages[0] if messages else "current ring edges do not form a closed boundary"
+                self.report({'ERROR'}, f"Could not build cutter from the current Rings mesh: {detail}. Repair or isolate the upper ring, then run Build 2D Cutter again.")
+                return {'CANCELLED'}
+
+        store_platform_rings_data(obj, rings)
 
         count = build_2d_cutter_mesh_from_rings(
             obj,
@@ -5348,7 +5940,8 @@ class MINIATUREVOXELER_OT_extrude_platform_walls_up(Operator):
         obj["mv_platform_stage"] = "building_cutter_2d_open"
         enter_edit_vertex_wireframe(context, obj)
 
-        self.report({'INFO'}, f"Built editable 2D cutter from {len(rings)} ring(s), {count} vertices total. Inspect and clean it before closing.")
+        gap_text = f" Stitched {bridged_count} small gap(s)." if bridged_count else ""
+        self.report({'INFO'}, f"Built editable 2D cutter from current Rings mesh: {len(rings)} ring(s), {count} vertices total.{gap_text} Inspect and clean it before closing.")
         return {'FINISHED'}
 
 
@@ -5365,7 +5958,7 @@ class MINIATUREVOXELER_OT_build_platform_building_cutter_2d(Operator):
         settings = context.scene.miniature_voxeler_settings
         cutter_obj = get_platform_walls_object(settings)
         if cutter_obj is None:
-            self.report({'ERROR'}, "Build the 2D cutter first.")
+            self.report({'ERROR'}, "Build the 2D cutter from the rings object first.")
             return {'CANCELLED'}
 
         if context.mode != 'OBJECT':
@@ -5377,9 +5970,124 @@ class MINIATUREVOXELER_OT_build_platform_building_cutter_2d(Operator):
             return {'CANCELLED'}
 
         cutter_obj["mv_platform_stage"] = "building_cutter_2d_closed"
-        enter_edit_vertex_wireframe(context, cutter_obj)
 
         self.report({'INFO'}, f"Closed the 2D cutter with Beauty Fill: {triangle_count} triangle(s) from {closed_count} inner-loop vertices.")
+        return {'FINISHED'}
+
+
+class MINIATUREVOXELER_OT_subdivide_platform_fill(Operator):
+    bl_idname = "object.mv_platform_fill_subdivide"
+    bl_label = "Subdivide Fill"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        settings = getattr(context.scene, "miniature_voxeler_settings", None)
+        return settings is not None and get_platform_walls_object(settings) is not None
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        cutter_obj = get_platform_walls_object(settings)
+        if cutter_obj is None:
+            self.report({'ERROR'}, "Close the 2D cutter first.")
+            return {'CANCELLED'}
+
+        selected_count = select_platform_fill_faces(context, cutter_obj)
+        if selected_count == 0:
+            self.report({'ERROR'}, "No Beauty Fill faces are tagged. Run Beauty Fill Inner Loop first.")
+            return {'CANCELLED'}
+
+        bpy.ops.mesh.subdivide(number_cuts=settings.platform_fill_subdivide_cuts, smoothness=0.0)
+        bpy.ops.object.mode_set(mode='OBJECT')
+        tagged_count = update_platform_fill_tag_from_selected_faces(cutter_obj)
+        select_platform_fill_faces(context, cutter_obj)
+
+        cutter_obj["mv_platform_stage"] = "building_cutter_2d_fill_subdivided"
+        self.report({'INFO'}, f"Subdivided {selected_count} Beauty Fill face(s) with {settings.platform_fill_subdivide_cuts} cut(s); {tagged_count} fill face(s) are selected for sculpt smoothing.")
+        return {'FINISHED'}
+
+
+class MINIATUREVOXELER_OT_prepare_platform_sculpting(Operator):
+    bl_idname = "object.mv_platform_prepare_sculpting"
+    bl_label = "Prepare for Sculpting"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        settings = getattr(context.scene, "miniature_voxeler_settings", None)
+        return settings is not None and get_platform_walls_object(settings) is not None
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        cutter_obj = get_platform_walls_object(settings)
+        if cutter_obj is None:
+            self.report({'ERROR'}, "Close and subdivide the 2D cutter fill first.")
+            return {'CANCELLED'}
+
+        fill_count = select_platform_fill_faces(context, cutter_obj)
+        if fill_count == 0:
+            self.report({'ERROR'}, "No Beauty Fill faces are tagged. Run Beauty Fill and Subdivide Fill first.")
+            return {'CANCELLED'}
+
+        bpy.ops.object.mode_set(mode='OBJECT')
+        assign_sculpt_face_sets_for_platform_fill(cutter_obj)
+
+        select_platform_fill_faces(context, cutter_obj)
+        bpy.ops.object.mode_set(mode='SCULPT')
+        create_sculpt_face_set_from_current_selection(context)
+
+        select_platform_fill_faces(context, cutter_obj, invert=True)
+        bpy.ops.object.mode_set(mode='SCULPT')
+        create_sculpt_face_set_from_current_selection(context)
+
+        select_platform_fill_faces(context, cutter_obj, invert=True)
+        bpy.ops.mesh.hide(unselected=False)
+        bpy.ops.object.mode_set(mode='SCULPT')
+        enable_sculpt_face_set_automasking(context)
+
+        cutter_obj["mv_platform_stage"] = "building_cutter_2d_sculpt_ready"
+        self.report({'INFO'}, f"Sculpting ready on {cutter_obj.name}: flat rings hidden, Face Set automasking enabled where available.")
+        return {'FINISHED'}
+
+
+class MINIATUREVOXELER_OT_select_platform_sculpt_brush(Operator):
+    bl_idname = "object.mv_platform_select_sculpt_brush"
+    bl_label = "Select Sculpt Brush"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    brush_type: EnumProperty(
+        name="Brush",
+        items=[
+            ('SMOOTH', "Smooth", "Use the Smooth sculpt brush"),
+            ('GRAB', "Grab", "Use the Grab sculpt brush"),
+            ('FLATTEN_CONTRAST', "Flatten/Contrast", "Use the Flatten/Contrast sculpt brush"),
+            ('RELAX_PINCH', "Relax Pinch", "Use the Relax Pinch sculpt brush"),
+        ],
+        default='SMOOTH',
+    )
+
+    @classmethod
+    def poll(cls, context):
+        settings = getattr(context.scene, "miniature_voxeler_settings", None)
+        return settings is not None and get_platform_walls_object(settings) is not None
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        cutter_obj = get_platform_walls_object(settings)
+        if cutter_obj is None:
+            self.report({'ERROR'}, "Prepare the sculpting mesh first.")
+            return {'CANCELLED'}
+
+        set_active_object(context, cutter_obj)
+        selected = select_sculpt_brush_tool(context, self.brush_type)
+        enable_sculpt_face_set_automasking(context)
+
+        brush_label = SCULPT_BRUSH_LABELS.get(self.brush_type, "Sculpt")
+        if not selected:
+            self.report({'WARNING'}, f"{brush_label} tool id was not found, but Sculpt Mode and Face Set automasking are active.")
+            return {'FINISHED'}
+
+        self.report({'INFO'}, f"{brush_label} brush selected with Face Set automasking enabled.")
         return {'FINISHED'}
 
 
@@ -5400,7 +6108,7 @@ class MINIATUREVOXELER_OT_build_platform_walls_mesh(Operator):
         settings = context.scene.miniature_voxeler_settings
         cutter_obj = get_platform_walls_object(settings)
         if cutter_obj is None:
-            self.report({'ERROR'}, "Build and close the 2D cutter first.")
+            self.report({'ERROR'}, "Build and close the 2D cutter from the rings object first.")
             return {'CANCELLED'}
 
         if context.mode != 'OBJECT':
@@ -5433,7 +6141,7 @@ class MINIATUREVOXELER_OT_smooth_remesh_platform_cutter(Operator):
         settings = context.scene.miniature_voxeler_settings
         cutter_obj = get_platform_walls_object(settings)
         if cutter_obj is None:
-            self.report({'ERROR'}, "Build the cutter first.")
+            self.report({'ERROR'}, "Build the cutter from the rings object first.")
             return {'CANCELLED'}
 
         remeshed = apply_smooth_remesh_modifier(
@@ -5472,7 +6180,7 @@ class MINIATUREVOXELER_OT_build_platform_foot_mesh(Operator):
         building_obj = get_building_object(settings)
         cutter_obj = get_platform_walls_object(settings)
         if building_obj is None or cutter_obj is None:
-            self.report({'ERROR'}, "Pick a building and extrude the cutter first.")
+            self.report({'ERROR'}, "Pick a building and extrude the rings object into a cutter first.")
             return {'CANCELLED'}
 
         if context.mode != 'OBJECT':
@@ -5490,7 +6198,7 @@ class MINIATUREVOXELER_OT_build_platform_foot_mesh(Operator):
         working_building_obj = duplicate_object(context, building_obj, copy_name)
         set_metadata(working_building_obj, root_name, building_obj.name)
         working_building_obj.hide_set(False)
-        building_obj.hide_set(False)
+        building_obj.hide_set(True)
 
         foot_obj = duplicate_object(context, working_building_obj, get_platform_foot_name(root_name))
         foot_obj.data.name = foot_obj.name
@@ -5515,11 +6223,12 @@ class MINIATUREVOXELER_OT_build_platform_foot_mesh(Operator):
         bpy.ops.object.modifier_apply(modifier=copy_mod.name)
 
         foot_obj["mv_platform_stage"] = "foot_from_building_slice"
-        working_building_obj["mv_platform_stage"] = "building_copy_sliced"
+        working_building_obj["mv_platform_stage"] = "building_body_sliced"
         set_active_object(context, foot_obj)
-        cutter_obj.hide_set(False)
+        cutter_name = cutter_obj.name
+        remove_object_if_exists(cutter_obj)
 
-        self.report({'INFO'}, f"Sliced {working_building_obj.name}; original building is untouched and the foot is {foot_obj.name}.")
+        self.report({'INFO'}, f"Sliced {working_building_obj.name}; original building is untouched, the foot is {foot_obj.name}, and temporary rings object {cutter_name} was deleted.")
         return {'FINISHED'}
 
 
@@ -5653,6 +6362,8 @@ class MINIATUREVOXELER_PT_panel(Panel):
             box.label(text="Choose a Building mesh first.")
         elif platform_obj is None:
             box.label(text="Choose a Platform mesh first.")
+        elif not source_pair_is_validated(settings, building_obj, platform_obj):
+            box.label(text="Apply transforms and resolve scale warnings before continuing.")
         else:
             box.label(text="Building and Platform are ready.")
 
@@ -5662,39 +6373,36 @@ class MINIATUREVOXELER_PT_panel(Panel):
             box = self.draw_step_box(layout, 'PLATFORM', "1.1 Platform Footprint", "Use this only if you need the platform hole and print foot.")
             col = box.column(align=True)
             col.prop(settings, "platform_limited_dissolve_angle")
-            col.operator("object.miniature_voxeler_prepare_platform_copy", text="Create Editable Platform Copy", icon='DUPLICATE')
+            col.operator("object.miniature_voxeler_prepare_platform_copy", text="Create Hole Selection Mesh", icon='DUPLICATE')
 
-            # Step 1.2 extracts the existing vertical wall faces from the clean platform copy.
+            # Step 1.2 extracts the existing vertical wall faces from the clean hole selection mesh.
             box = self.draw_step_box(layout, 'PLATFORM', "1.2 Hole Walls (Faces)", "Select the visible hole wall faces, then separate them.")
             row = box.row(align=True)
             row.operator("object.mv_platform_walls_select", text="Select Hole Faces", icon='FACESEL')
             row.operator("object.mv_platform_walls_separate", text="Separate Hole Walls", icon='MESH_CUBE')
 
-            # Step 1.3 extracts platform boundary edges that should become missing wall faces.
-            box = self.draw_step_box(layout, 'PLATFORM', "1.3 Missing Walls (Edges)", "Select platform boundary edges that should become missing walls.")
+            # Step 1.3 manually repairs missing ring vertices and bridge edges.
+            box = self.draw_step_box(layout, 'PLATFORM', "1.3 Repair Rings")
+            box.prop(settings, "platform_bridge_vertex_distance_mm")
             repair_row = box.row(align=True)
-            repair_row.operator("object.mv_platform_missing_walls_select", text="Select Missing Wall Edges", icon='EDGESEL')
-            repair_row.operator("object.mv_platform_missing_walls_separate", text="Separate Missing Wall Edges", icon='MESH_DATA')
-            box.operator("object.mv_platform_missing_walls_build", text="Build Missing Wall Faces", icon='MESH_CUBE')
+            repair_row.operator("object.mv_platform_add_vertex_to_rings", text="Add Vertex To Rings", icon='VERTEXSEL')
+            repair_row.operator("object.mv_platform_bridge_rings_vertices", text="Bridge Rings Vertices", icon='EDGESEL')
+
+            # Step 1.4 makes the upper ring selection a manual lasso/isolate pass.
+            box = self.draw_step_box(layout, 'PLATFORM', "1.4 Select Upper Ring")
+            ring_row = box.row(align=True)
+            ring_row.operator("object.mv_platform_select_upper_ring", text="Select Upper Ring", icon='SELECT_SET')
+            ring_row.operator("object.mv_platform_isolate_upper_ring", text="Isolate Upper Ring", icon='SELECT_INTERSECT')
 
             self.draw_cleanup_toolbox(
                 layout,
                 settings,
                 'PLATFORM',
-                "1.4 Clean Cutter",
-                "Clean the combined cutter wall mesh before storing the upper loop.",
+                "1.5 Clean Rings",
+                "Clean the isolated rings mesh before storing the loops.",
             )
 
-            # Step 1.5 stores the upper platform loop as the reusable cutter path.
-            box = self.draw_step_box(layout, 'PLATFORM', "1.5 Store Ring")
-            box.prop(settings, "platform_ring_gap_tolerance")
-            box.operator("object.mv_platform_wall_loop", text="Store Upper Loop And Reduce To Ring", icon='EDGESEL')
-            if walls_obj is None:
-                box.label(text="Separate the platform cutter first.")
-            else:
-                box.label(text=f"Current cutter object: {walls_obj.name}")
-
-            # Step 1.6 expands the stored ring into an editable 2D cutter guide.
+            # Step 1.6 expands the current isolated rings into an editable 2D cutter guide.
             box = self.draw_step_box(layout, 'PLATFORM', "1.6 Build 2D Cutter")
             cutter_col = box.column(align=True)
             cutter_col.prop(settings, "platform_inner_thickness_mm")
@@ -5714,22 +6422,37 @@ class MINIATUREVOXELER_PT_panel(Panel):
             box.label(text="Fills the inner loop with Beauty Fill.")
             box.label(text="Inspect and manually fix holes or strange areas before the next step.")
             box.operator("object.mv_platform_cutter_close_2d", text="Beauty Fill Inner Loop", icon='FACESEL')
+            box.prop(settings, "platform_fill_subdivide_cuts")
+            box.operator("object.mv_platform_fill_subdivide", text="Subdivide Fill", icon='MOD_SUBSURF')
 
-            # Step 1.9 extrudes the platform cutter downward through the building.
-            box = self.draw_step_box(layout, 'PLATFORM', "1.9 Extrude Cutter")
+            # Step 1.9 prepares protected sculpting on the editable center and inner-band faces.
+            box = self.draw_step_box(layout, 'PLATFORM', "1.9 Sculpt")
+            box.operator("object.mv_platform_prepare_sculpting", text="Prepare for Sculpting", icon='SCULPTMODE_HLT')
+            row = box.row(align=True)
+            op = row.operator("object.mv_platform_select_sculpt_brush", text="Smooth", icon='BRUSH_DATA')
+            op.brush_type = 'SMOOTH'
+            op = row.operator("object.mv_platform_select_sculpt_brush", text="Grab", icon='BRUSH_DATA')
+            op.brush_type = 'GRAB'
+            op = row.operator("object.mv_platform_select_sculpt_brush", text="Flatten/Contrast", icon='BRUSH_DATA')
+            op.brush_type = 'FLATTEN_CONTRAST'
+            op = row.operator("object.mv_platform_select_sculpt_brush", text="Relax Pinch", icon='BRUSH_DATA')
+            op.brush_type = 'RELAX_PINCH'
+
+            # Step 1.10 extrudes the platform rings object downward through the building.
+            box = self.draw_step_box(layout, 'PLATFORM', "1.10 Extrude Cutter")
             box.prop(settings, "platform_cutter_depth_mm")
             box.operator("object.mv_platform_walls_build_mesh", text="Extrude Cutter Down", icon='MESH_CUBE')
 
-            # Step 1.10 remeshes the cutter to soften or repair the platform cut shape.
-            box = self.draw_step_box(layout, 'PLATFORM', "1.10 Smooth Cutter")
+            # Step 1.11 remeshes the cutter to soften or repair the platform cut shape.
+            box = self.draw_step_box(layout, 'PLATFORM', "1.11 Smooth Cutter")
             remesh_col = box.column(align=True)
             remesh_col.prop(settings, "platform_remesh_octree_depth")
             remesh_col.prop(settings, "platform_remesh_scale")
             remesh_col.prop(settings, "platform_remesh_remove_disconnected")
             remesh_col.operator("object.mv_platform_cutter_smooth_remesh", text="Smooth Remesh Cutter", icon='MOD_REMESH')
 
-            # Step 1.11 uses the platform cutter to split the building copy and print foot.
-            box = self.draw_step_box(layout, 'PLATFORM', "1.11 Slice Building")
+            # Step 1.12 uses the platform cutter to split the building body and print foot.
+            box = self.draw_step_box(layout, 'PLATFORM', "1.12 Slice Building")
             box.operator("object.mv_platform_building_slice", text="Slice Building And Create _foot", icon='SELECT_DIFFERENCE')
             if foot_obj is not None:
                 box.label(text=f"Current foot object: {foot_obj.name}")
@@ -5859,12 +6582,20 @@ classes = (
     MINIATUREVOXELER_OT_prepare_platform_missing_walls_selection,
     MINIATUREVOXELER_OT_separate_platform_missing_walls,
     MINIATUREVOXELER_OT_build_platform_missing_walls,
+    MINIATUREVOXELER_OT_add_vertex_to_rings,
+    MINIATUREVOXELER_OT_bridge_rings_vertices,
+    MINIATUREVOXELER_OT_select_platform_upper_ring,
+    MINIATUREVOXELER_OT_isolate_platform_upper_ring,
     MINIATUREVOXELER_OT_merge_platform_walls_by_distance,
     MINIATUREVOXELER_OT_merge_platform_walls_at_center,
     MINIATUREVOXELER_OT_cleanup_platform_limited_dissolve,
     MINIATUREVOXELER_OT_prepare_platform_wall_loop_selection,
+    MINIATUREVOXELER_OT_select_platform_ring_loops,
     MINIATUREVOXELER_OT_extrude_platform_walls_up,
     MINIATUREVOXELER_OT_build_platform_building_cutter_2d,
+    MINIATUREVOXELER_OT_subdivide_platform_fill,
+    MINIATUREVOXELER_OT_prepare_platform_sculpting,
+    MINIATUREVOXELER_OT_select_platform_sculpt_brush,
     MINIATUREVOXELER_OT_build_platform_walls_mesh,
     MINIATUREVOXELER_OT_smooth_remesh_platform_cutter,
     MINIATUREVOXELER_OT_build_platform_foot_mesh,
@@ -5882,6 +6613,7 @@ stale_class_names = (
     "MINIATUREVOXELER_OT_apply_platform_building_booleans",
     "MINIATUREVOXELER_OT_apply_platform_foot_boolean",
     "MINIATUREVOXELER_OT_inset_building_copy",
+    "MINIATUREVOXELER_OT_prepare_platform_sculpt_smooth",
 )
 
 def register():
