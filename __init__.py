@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Miniature Voxeler",
     "author": "OpenAI",
-    "version": (3, 10, 1),
+    "version": (3, 11, 7),
     "blender": (5, 0, 1),
     "location": "3D View > Sidebar > Miniature Voxeler",
     "description": "Block remesh, transfer texture, create Lego-color face materials, and generate Lego skin meshes for miniature voxel workflows",
@@ -14,6 +14,7 @@ import gpu
 import json
 from gpu_extras.batch import batch_for_shader
 from math import atan2, cos, hypot, pi, radians, sin
+from time import perf_counter
 from bpy_extras import view3d_utils
 from mathutils import Vector
 from bpy.types import Operator, Panel, PropertyGroup
@@ -27,7 +28,7 @@ from bpy.props import (
     EnumProperty,
 )
 
-ADDON_VERSION_TEXT = "v.3.10.1"
+ADDON_VERSION_TEXT = "v.3.11.7"
 
 
 def srgb_channel_to_linear(value):
@@ -221,6 +222,41 @@ def get_building_copy_object(settings):
     return obj
 
 
+def create_building_body_copy(context, settings):
+    building_obj = get_building_object(settings)
+    if building_obj is None:
+        return None
+
+    root_name = get_root_name(building_obj.name)
+    body_name = get_building_copy_name(root_name)
+    existing_obj = bpy.data.objects.get(body_name)
+    if existing_obj is not None:
+        remove_object_if_exists(existing_obj)
+
+    body_obj = building_obj.copy()
+    body_obj.data = building_obj.data.copy()
+    body_obj.name = body_name
+    body_obj.data.name = body_name
+    for collection in building_obj.users_collection:
+        collection.objects.link(body_obj)
+        break
+    else:
+        context.collection.objects.link(body_obj)
+
+    set_metadata(body_obj, root_name, building_obj.name)
+    body_obj.matrix_world = building_obj.matrix_world.copy()
+    body_obj.hide_set(False)
+    building_obj.hide_set(True)
+    return body_obj
+
+
+def ensure_building_body_object(context, settings):
+    body_obj = get_building_copy_object(settings)
+    if body_obj is not None:
+        return body_obj
+    return create_building_body_copy(context, settings)
+
+
 def get_voxel_source_object(settings):
     copy_obj = get_building_copy_object(settings)
     if copy_obj is not None:
@@ -273,7 +309,7 @@ def get_texture_source_object(settings):
     if override_name:
         return bpy.data.objects.get(override_name)
 
-    return get_building_object(settings)
+    return get_building_copy_object(settings)
 
 
 def get_view3d_window_region(area):
@@ -373,31 +409,29 @@ def get_polygon_center(mesh, poly):
     return center / max(1, len(poly.vertices))
 
 
-def paint_faces_with_brush(context, event, obj, slot_index, brush_size):
+def collect_brush_face_indices(context, event, obj, brush_size, face_centers_world=None):
     hit_obj, face_index = raycast_active_face(context, event)
     if hit_obj is None or face_index is None:
-        return 0
+        return set()
 
     mesh = hit_obj.data
     radius = max(1.0, float(brush_size))
-    changed_count = 0
 
     if radius <= 1.0:
-        if mesh.polygons[face_index].material_index != slot_index:
-            mesh.polygons[face_index].material_index = slot_index
-            changed_count = 1
-        mesh.update()
-        return changed_count
+        return {face_index}
 
     region, region_3d, mouse_coord = get_mouse_region_coord(context, event)
     if region is None:
-        return 0
+        return {face_index}
 
     radius_sq = radius * radius
-    faces_to_paint = {face_index}
+    face_indices = {face_index}
 
     for poly in mesh.polygons:
-        center = hit_obj.matrix_world @ get_polygon_center(mesh, poly)
+        if face_centers_world is not None and poly.index < len(face_centers_world):
+            center = face_centers_world[poly.index]
+        else:
+            center = hit_obj.matrix_world @ get_polygon_center(mesh, poly)
         screen_coord = view3d_utils.location_3d_to_region_2d(region, region_3d, center)
         if screen_coord is None:
             continue
@@ -405,14 +439,228 @@ def paint_faces_with_brush(context, event, obj, slot_index, brush_size):
         dx = screen_coord.x - mouse_coord[0]
         dy = screen_coord.y - mouse_coord[1]
         if (dx * dx) + (dy * dy) <= radius_sq:
-            faces_to_paint.add(poly.index)
+            face_indices.add(poly.index)
 
-    for paint_face_index in faces_to_paint:
+    return face_indices
+
+
+def get_voxel_face_key_from_mesh(mesh, face_index):
+    return (
+        get_face_attribute_value(mesh, "mv_cell_i", face_index),
+        get_face_attribute_value(mesh, "mv_cell_j", face_index),
+        get_face_attribute_value(mesh, "mv_cell_k", face_index),
+        get_face_attribute_value(mesh, "mv_face_dir", face_index),
+    )
+
+
+def get_voxel_cell_key_from_mesh(mesh, face_index):
+    key = get_voxel_face_key_from_mesh(mesh, face_index)
+    return key[:3]
+
+
+def serialize_voxel_face_slots(face_slots):
+    data = [
+        [key[0], key[1], key[2], key[3], slot]
+        for key, slot in sorted(face_slots.items())
+    ]
+    return json.dumps(data, separators=(",", ":"))
+
+
+def deserialize_voxel_face_slots(obj):
+    raw = obj.get("mv_voxel_face_slots_json", "")
+    if not raw:
+        return {}
+
+    try:
+        values = json.loads(raw)
+    except Exception:
+        return {}
+
+    face_slots = {}
+    for item in values:
+        if len(item) != 5:
+            continue
+        face_slots[(int(item[0]), int(item[1]), int(item[2]), int(item[3]))] = int(item[4])
+    return face_slots
+
+
+def collect_voxel_face_slots_from_mesh(obj, cells=None):
+    mesh = obj.data
+    face_slots = {}
+    if not mesh.polygons:
+        return face_slots
+    required_attrs = ("mv_cell_i", "mv_cell_j", "mv_cell_k", "mv_face_dir")
+    if any(mesh.attributes.get(attr_name) is None for attr_name in required_attrs):
+        return face_slots
+
+    for poly in mesh.polygons:
+        key = get_voxel_face_key_from_mesh(mesh, poly.index)
+        if key[3] < 0:
+            continue
+        face_slots[key] = int(poly.material_index)
+    return face_slots
+
+
+def store_voxel_face_slots(obj, face_slots):
+    obj["mv_voxel_face_slots_json"] = serialize_voxel_face_slots(face_slots)
+
+
+def sync_voxel_cell_slots_from_face_slots(cells, face_slots):
+    counts_by_cell = {}
+    for key, slot in face_slots.items():
+        cell = key[:3]
+        counts = counts_by_cell.setdefault(cell, {})
+        counts[int(slot)] = counts.get(int(slot), 0) + 1
+    for cell, counts in counts_by_cell.items():
+        if cell in cells and counts:
+            cells[cell] = max(counts.items(), key=lambda item: (item[1], -item[0]))[0]
+    return cells
+
+
+def sync_voxel_color_state_from_mesh(obj):
+    cells = deserialize_voxel_cells(obj)
+    if not cells:
+        return {}
+    face_slots = collect_voxel_face_slots_from_mesh(obj, cells)
+    sync_voxel_cell_slots_from_face_slots(cells, face_slots)
+    store_voxel_face_slots(obj, face_slots)
+    origin = get_stored_voxel_origin(obj)
+    voxel_size = float(obj.get("mv_voxel_size", 0.0))
+    if origin is not None and voxel_size > 0.0:
+        store_voxel_state(obj, origin, voxel_size, cells)
+    return face_slots
+
+
+def get_voxel_face_centers_world(obj):
+    mesh = obj.data
+    matrix = obj.matrix_world
+    return [matrix @ get_polygon_center(mesh, poly) for poly in mesh.polygons]
+
+
+def get_voxel_cell_world_corners(obj, coord, inflate=0.0):
+    origin = get_stored_voxel_origin(obj)
+    voxel_size = float(obj.get("mv_voxel_size", 0.0))
+    if origin is None or voxel_size <= 0.0:
+        return []
+
+    i, j, k = coord
+    base = origin + Vector((i * voxel_size, j * voxel_size, k * voxel_size))
+    low = -float(inflate)
+    high = 1.0 + float(inflate)
+    corners = [
+        obj.matrix_world @ Vector((base.x + (x * voxel_size), base.y + (y * voxel_size), base.z + (z * voxel_size)))
+        for x, y, z in (
+            (low, low, low), (high, low, low), (high, high, low), (low, high, low),
+            (low, low, high), (high, low, high), (high, high, high), (low, high, high),
+        )
+    ]
+    return corners
+
+
+def get_voxel_cell_wire_coords(obj, coord, inflate=0.0):
+    corners = get_voxel_cell_world_corners(obj, coord, inflate)
+    if not corners:
+        return []
+    edge_indices = (
+        (0, 1), (1, 2), (2, 3), (3, 0),
+        (4, 5), (5, 6), (6, 7), (7, 4),
+        (0, 4), (1, 5), (2, 6), (3, 7),
+    )
+    coords = []
+    for start, end in edge_indices:
+        coords.append(tuple(corners[start]))
+        coords.append(tuple(corners[end]))
+    return coords
+
+
+def get_voxel_cell_face_coords(obj, coord, inflate=0.0):
+    corners = get_voxel_cell_world_corners(obj, coord, inflate)
+    if not corners:
+        return []
+    face_indices = (
+        (0, 1, 2, 3),
+        (4, 7, 6, 5),
+        (0, 4, 5, 1),
+        (1, 5, 6, 2),
+        (2, 6, 7, 3),
+        (3, 7, 4, 0),
+    )
+    coords = []
+    for a, b, c, d in face_indices:
+        coords.extend((tuple(corners[a]), tuple(corners[b]), tuple(corners[c])))
+        coords.extend((tuple(corners[a]), tuple(corners[c]), tuple(corners[d])))
+    return coords
+
+
+def draw_voxel_wire_cells(obj, coords, color):
+    if obj is None or not coords:
+        return
+    try:
+        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    except ValueError:
+        shader = gpu.shader.from_builtin('3D_UNIFORM_COLOR')
+    batch = batch_for_shader(shader, 'LINES', {"pos": coords})
+    gpu.state.blend_set('ALPHA')
+    gpu.state.line_width_set(2.0)
+    try:
+        gpu.state.depth_test_set('LESS_EQUAL')
+    except Exception:
+        pass
+    shader.bind()
+    shader.uniform_float("color", color)
+    batch.draw(shader)
+    try:
+        gpu.state.depth_test_set('NONE')
+    except Exception:
+        pass
+    gpu.state.line_width_set(1.0)
+    gpu.state.blend_set('NONE')
+
+
+def draw_voxel_transparent_cells(obj, coords, color):
+    if obj is None or not coords:
+        return
+    try:
+        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    except ValueError:
+        shader = gpu.shader.from_builtin('3D_UNIFORM_COLOR')
+    batch = batch_for_shader(shader, 'TRIS', {"pos": coords})
+    gpu.state.blend_set('ALPHA')
+    try:
+        gpu.state.depth_test_set('LESS_EQUAL')
+    except Exception:
+        pass
+    shader.bind()
+    shader.uniform_float("color", color)
+    batch.draw(shader)
+    try:
+        gpu.state.depth_test_set('NONE')
+    except Exception:
+        pass
+    gpu.state.blend_set('NONE')
+
+
+def paint_faces_with_brush(context, event, obj, slot_index, brush_size, face_slots=None, commit_face_slots=True, face_centers_world=None):
+    face_indices = collect_brush_face_indices(context, event, obj, brush_size, face_centers_world)
+    if not face_indices:
+        return 0
+
+    mesh = obj.data
+    changed_count = 0
+
+    for paint_face_index in face_indices:
         if mesh.polygons[paint_face_index].material_index != slot_index:
             mesh.polygons[paint_face_index].material_index = slot_index
             changed_count += 1
+        if face_slots is not None:
+            key = get_voxel_face_key_from_mesh(mesh, paint_face_index)
+            if key[3] >= 0:
+                face_slots[key] = int(slot_index)
 
-    mesh.update()
+    if changed_count:
+        if face_slots is not None and commit_face_slots:
+            store_voxel_face_slots(obj, face_slots)
+        mesh.update()
     return changed_count
 
 
@@ -642,7 +890,12 @@ def get_face_int_attribute_values(mesh, name, default_value=0):
     return [int(item.value) for item in attribute.data]
 
 
-def rebuild_voxel_mesh_from_cells(obj, origin, voxel_size, cells):
+def rebuild_voxel_mesh_from_cells(obj, origin, voxel_size, cells, face_slots=None, store_state=True):
+    if face_slots is None:
+        face_slots = deserialize_voxel_face_slots(obj)
+        if not face_slots and obj.data.polygons:
+            face_slots = collect_voxel_face_slots_from_mesh(obj, cells)
+
     directions = [
         ((1, 0, 0), ((1, 0, 0), (1, 0, 1), (1, 1, 1), (1, 1, 0))),
         ((-1, 0, 0), ((0, 1, 0), (0, 1, 1), (0, 0, 1), (0, 0, 0))),
@@ -695,7 +948,8 @@ def rebuild_voxel_mesh_from_cells(obj, origin, voxel_size, cells):
                 )
                 face.append(get_vert_index(position))
             faces.append(tuple(face))
-            material_indices.append(max(0, int(slot_index)))
+            face_key = (i, j, k, dir_index)
+            material_indices.append(max(0, int(face_slots.get(face_key, slot_index))))
             face_cell_i.append(i)
             face_cell_j.append(j)
             face_cell_k.append(k)
@@ -714,7 +968,13 @@ def rebuild_voxel_mesh_from_cells(obj, origin, voxel_size, cells):
         ensure_face_int_attribute(obj.data, "mv_cell_k", face_cell_k)
         ensure_face_int_attribute(obj.data, "mv_face_dir", face_dir)
 
-    store_voxel_state(obj, origin, voxel_size, cells)
+    visible_face_slots = {
+        (face_cell_i[index], face_cell_j[index], face_cell_k[index], face_dir[index]): int(material_indices[index])
+        for index in range(len(material_indices))
+    }
+    if store_state:
+        store_voxel_face_slots(obj, visible_face_slots)
+        store_voxel_state(obj, origin, voxel_size, cells)
     obj.data.update()
 
 
@@ -827,72 +1087,489 @@ def get_face_attribute_value(mesh, attribute_name, face_index, default_value=0):
     return int(attribute.data[face_index].value)
 
 
-def edit_voxel_cells_with_brush(context, event, obj, action, slot_index, brush_size):
+def get_slot_for_new_voxel_cell(cells, face_slots, target_coord, source_cell=None, source_face_dir=None, fallback_slot=0):
+    if source_cell is not None and source_face_dir is not None:
+        source_face_key = (source_cell[0], source_cell[1], source_cell[2], source_face_dir)
+        if source_face_key in face_slots:
+            return int(face_slots[source_face_key])
+        if source_cell in cells:
+            return int(cells[source_cell])
+
+    best_distance_sq = None
+    best_count_by_slot = {}
+    for radius in range(1, 5):
+        current_counts = {}
+        for dx in range(-radius, radius + 1):
+            for dy in range(-radius, radius + 1):
+                for dz in range(-radius, radius + 1):
+                    if max(abs(dx), abs(dy), abs(dz)) != radius:
+                        continue
+                    coord = (target_coord[0] + dx, target_coord[1] + dy, target_coord[2] + dz)
+                    if coord not in cells:
+                        continue
+                    distance_sq = (dx * dx) + (dy * dy) + (dz * dz)
+                    if best_distance_sq is None or distance_sq < best_distance_sq:
+                        best_distance_sq = distance_sq
+                        current_counts = {int(cells[coord]): 1}
+                    elif distance_sq == best_distance_sq:
+                        slot = int(cells[coord])
+                        current_counts[slot] = current_counts.get(slot, 0) + 1
+
+        if best_distance_sq is not None:
+            best_count_by_slot = current_counts
+            break
+
+    if best_count_by_slot:
+        return max(best_count_by_slot.items(), key=lambda item: (item[1], -item[0]))[0]
+    return int(fallback_slot)
+
+
+def get_grid_brush_radius_cells(brush_size):
+    radius_cells = max(0, min(8, int((max(1.0, float(brush_size)) - 1.0) / 12.0)))
+    return radius_cells
+
+
+def get_grid_brush_offsets_for_face(face_dir, brush_size):
+    radius_cells = get_grid_brush_radius_cells(brush_size)
+    if radius_cells <= 0:
+        return [(0, 0, 0)]
+
+    offsets = []
+    for a in range(-radius_cells, radius_cells + 1):
+        for b in range(-radius_cells, radius_cells + 1):
+            if (a * a) + (b * b) > radius_cells * radius_cells:
+                continue
+            if face_dir in (0, 1):
+                offsets.append((0, a, b))
+            elif face_dir in (2, 3):
+                offsets.append((a, 0, b))
+            else:
+                offsets.append((a, b, 0))
+    return offsets
+
+
+def get_grid_brush_sphere_offsets(brush_size):
+    radius_cells = get_grid_brush_radius_cells(brush_size)
+    if radius_cells <= 0:
+        return [(0, 0, 0)]
+
+    offsets = []
+    radius_sq = radius_cells * radius_cells
+    for dx in range(-radius_cells, radius_cells + 1):
+        for dy in range(-radius_cells, radius_cells + 1):
+            for dz in range(-radius_cells, radius_cells + 1):
+                if (dx * dx) + (dy * dy) + (dz * dz) <= radius_sq:
+                    offsets.append((dx, dy, dz))
+    return offsets
+
+
+def get_grid_brush_target_coords(center_coord, face_dir, brush_size):
+    return [
+        (
+            center_coord[0] + offset[0],
+            center_coord[1] + offset[1],
+            center_coord[2] + offset[2],
+        )
+        for offset in get_grid_brush_sphere_offsets(brush_size)
+    ]
+
+
+def get_axis_for_face_dir(face_dir):
+    if face_dir in (0, 1):
+        return 0
+    if face_dir in (2, 3):
+        return 1
+    return 2
+
+
+def get_face_dir_from_neighbor_delta(delta):
+    directions = get_voxel_cell_face_vectors()
+    for index, direction in enumerate(directions):
+        if tuple(direction) == tuple(delta):
+            return index
+    return None
+
+
+def get_fallback_face_dir_from_ray(local_direction):
+    components = [abs(local_direction.x), abs(local_direction.y), abs(local_direction.z)]
+    axis = components.index(max(components))
+    if axis == 0:
+        return 1 if local_direction.x > 0 else 0
+    if axis == 1:
+        return 3 if local_direction.y > 0 else 2
+    return 5 if local_direction.z > 0 else 4
+
+
+def ray_aabb_intersection(ray_origin, ray_direction, bbox_min, bbox_max):
+    t_min = -float("inf")
+    t_max = float("inf")
+    for axis in range(3):
+        origin_value = ray_origin[axis]
+        direction_value = ray_direction[axis]
+        min_value = bbox_min[axis]
+        max_value = bbox_max[axis]
+        if abs(direction_value) < 1e-12:
+            if origin_value < min_value or origin_value > max_value:
+                return None
+            continue
+        t1 = (min_value - origin_value) / direction_value
+        t2 = (max_value - origin_value) / direction_value
+        if t1 > t2:
+            t1, t2 = t2, t1
+        t_min = max(t_min, t1)
+        t_max = min(t_max, t2)
+        if t_min > t_max:
+            return None
+    return t_min, t_max
+
+
+def build_voxel_grid_cache(obj, cells):
+    origin = get_stored_voxel_origin(obj)
+    voxel_size = float(obj.get("mv_voxel_size", 0.0))
+    if origin is None or voxel_size <= 0.0 or not cells:
+        return None
+    min_i = min(coord[0] for coord in cells) - 1
+    min_j = min(coord[1] for coord in cells) - 1
+    min_k = min(coord[2] for coord in cells) - 1
+    max_i = max(coord[0] for coord in cells) + 2
+    max_j = max(coord[1] for coord in cells) + 2
+    max_k = max(coord[2] for coord in cells) + 2
+    return {
+        "origin": origin,
+        "voxel_size": voxel_size,
+        "bounds": [min_i, min_j, min_k, max_i, max_j, max_k],
+        "matrix": obj.matrix_world.copy(),
+        "inverse_matrix": obj.matrix_world.inverted(),
+        "inverse_rotation": obj.matrix_world.inverted().to_3x3(),
+    }
+
+
+def expand_voxel_grid_cache(cache, coord):
+    if cache is None:
+        return
+    bounds = cache["bounds"]
+    bounds[0] = min(bounds[0], coord[0] - 1)
+    bounds[1] = min(bounds[1], coord[1] - 1)
+    bounds[2] = min(bounds[2], coord[2] - 1)
+    bounds[3] = max(bounds[3], coord[0] + 2)
+    bounds[4] = max(bounds[4], coord[1] + 2)
+    bounds[5] = max(bounds[5], coord[2] + 2)
+
+
+def get_voxel_cursor_hit(context, event, obj, cells, grid_cache=None, mode='ADD'):
+    if not cells:
+        return None
+
+    region, region_3d, mouse_coord = get_mouse_region_coord(context, event)
+    if region is None:
+        return None
+
+    if grid_cache is None:
+        grid_cache = build_voxel_grid_cache(obj, cells)
+    if grid_cache is None:
+        return None
+    origin = grid_cache["origin"]
+    voxel_size = grid_cache["voxel_size"]
+    min_i, min_j, min_k, max_i, max_j, max_k = grid_cache["bounds"]
+
+    ray_origin_world = view3d_utils.region_2d_to_origin_3d(region, region_3d, mouse_coord)
+    ray_direction_world = view3d_utils.region_2d_to_vector_3d(region, region_3d, mouse_coord)
+    inv_matrix = grid_cache["inverse_matrix"]
+    ray_origin = inv_matrix @ ray_origin_world
+    ray_direction = (grid_cache["inverse_rotation"] @ ray_direction_world).normalized()
+    bbox_min = Vector((
+        origin.x + (min_i * voxel_size),
+        origin.y + (min_j * voxel_size),
+        origin.z + (min_k * voxel_size),
+    ))
+    bbox_max = Vector((
+        origin.x + (max_i * voxel_size),
+        origin.y + (max_j * voxel_size),
+        origin.z + (max_k * voxel_size),
+    ))
+
+    intersection = ray_aabb_intersection(ray_origin, ray_direction, bbox_min, bbox_max)
+    if intersection is None:
+        return None
+    t_min, t_max = intersection
+    if t_max < 0.0:
+        return None
+
+    t = max(0.0, t_min) + (voxel_size * 1e-5)
+    point = ray_origin + (ray_direction * t)
+    current = [
+        int((point.x - origin.x) // voxel_size),
+        int((point.y - origin.y) // voxel_size),
+        int((point.z - origin.z) // voxel_size),
+    ]
+
+    step = [1 if ray_direction[axis] > 0.0 else -1 for axis in range(3)]
+    t_max_axis = [0.0, 0.0, 0.0]
+    t_delta = [0.0, 0.0, 0.0]
+    for axis in range(3):
+        direction_value = ray_direction[axis]
+        if abs(direction_value) < 1e-12:
+            t_max_axis[axis] = float("inf")
+            t_delta[axis] = float("inf")
+            continue
+        boundary_index = current[axis] + (1 if step[axis] > 0 else 0)
+        boundary = origin[axis] + (boundary_index * voxel_size)
+        t_max_axis[axis] = (boundary - ray_origin[axis]) / direction_value
+        t_delta[axis] = voxel_size / abs(direction_value)
+
+    max_steps = ((max_i - min_i) + (max_j - min_j) + (max_k - min_k) + 16) * 3
+    previous = None
+    previous_axis = None
+    for _ in range(max_steps):
+        cell = tuple(current)
+        if mode == 'REMOVE' and cell in cells:
+            face_dir = None
+            if previous is not None:
+                delta = (previous[0] - cell[0], previous[1] - cell[1], previous[2] - cell[2])
+                face_dir = get_face_dir_from_neighbor_delta(delta)
+            elif previous_axis is not None:
+                delta = [0, 0, 0]
+                delta[previous_axis] = -step[previous_axis]
+                face_dir = get_face_dir_from_neighbor_delta(tuple(delta))
+            return {
+                "cell": cell,
+                "face_dir": face_dir if face_dir is not None else get_fallback_face_dir_from_ray(ray_direction),
+                "previous": previous,
+            }
+        if mode == 'ADD' and cell in cells and previous is not None and previous not in cells:
+            delta = (previous[0] - cell[0], previous[1] - cell[1], previous[2] - cell[2])
+            face_dir = get_face_dir_from_neighbor_delta(delta)
+            return {
+                "cell": cell,
+                "face_dir": face_dir if face_dir is not None else get_fallback_face_dir_from_ray(ray_direction),
+                "previous": previous,
+            }
+        if cell in cells:
+            if previous is not None:
+                delta = (previous[0] - cell[0], previous[1] - cell[1], previous[2] - cell[2])
+                face_dir = get_face_dir_from_neighbor_delta(delta)
+            elif previous_axis is not None:
+                delta = [0, 0, 0]
+                delta[previous_axis] = -step[previous_axis]
+                face_dir = get_face_dir_from_neighbor_delta(tuple(delta))
+            else:
+                face_dir = get_fallback_face_dir_from_ray(ray_direction)
+            return {
+                "cell": cell,
+                "face_dir": face_dir if face_dir is not None else get_fallback_face_dir_from_ray(ray_direction),
+                "previous": previous,
+            }
+
+        axis = min(range(3), key=lambda item: t_max_axis[item])
+        if t_max_axis[axis] > t_max + voxel_size:
+            break
+        previous = cell
+        previous_axis = axis
+        current[axis] += step[axis]
+        t_max_axis[axis] += t_delta[axis]
+
+    return None
+
+
+def get_voxel_cursor_edit_target(context, event, obj, mode, cells, face_slots, fallback_slot, grid_cache=None):
+    hit = get_voxel_cursor_hit(context, event, obj, cells, grid_cache, mode)
+    if hit is None:
+        return None
+
+    cell = hit["cell"]
+    face_dir = hit["face_dir"]
+    directions = get_voxel_cell_face_vectors()
+    if mode == 'REMOVE':
+        return {
+            "cell": cell,
+            "target": cell,
+            "slot": None,
+            "face_dir": face_dir,
+        }
+
+    offset = directions[face_dir]
+    target = (
+        cell[0] + offset[0],
+        cell[1] + offset[1],
+        cell[2] + offset[2],
+    )
+    if target in cells:
+        return None
+    return {
+        "cell": cell,
+        "target": target,
+        "slot": None,
+        "fallback_slot": fallback_slot,
+        "face_dir": face_dir,
+    }
+
+
+def get_voxel_plane_edit_target(context, event, obj, cells, fallback_slot, grid_cache, face_dir, plane_coord):
+    region, region_3d, mouse_coord = get_mouse_region_coord(context, event)
+    if region is None or grid_cache is None:
+        return None
+
+    origin = grid_cache["origin"]
+    voxel_size = grid_cache["voxel_size"]
+    axis = get_axis_for_face_dir(face_dir)
+    ray_origin_world = view3d_utils.region_2d_to_origin_3d(region, region_3d, mouse_coord)
+    ray_direction_world = view3d_utils.region_2d_to_vector_3d(region, region_3d, mouse_coord)
+    ray_origin = grid_cache["inverse_matrix"] @ ray_origin_world
+    ray_direction = (grid_cache["inverse_rotation"] @ ray_direction_world).normalized()
+    if abs(ray_direction[axis]) < 1e-12:
+        return None
+
+    plane_value = origin[axis] + ((plane_coord + 0.5) * voxel_size)
+    t = (plane_value - ray_origin[axis]) / ray_direction[axis]
+    if t < 0.0:
+        return None
+
+    point = ray_origin + (ray_direction * t)
+    target = [
+        int((point.x - origin.x) // voxel_size),
+        int((point.y - origin.y) // voxel_size),
+        int((point.z - origin.z) // voxel_size),
+    ]
+    target[axis] = plane_coord
+    target = tuple(target)
+    direction = get_voxel_cell_face_vectors()[face_dir]
+    source_cell = (
+        target[0] - direction[0],
+        target[1] - direction[1],
+        target[2] - direction[2],
+    )
+    if source_cell not in cells or target in cells:
+        return None
+    return {
+        "cell": source_cell,
+        "target": target,
+        "slot": None,
+        "fallback_slot": fallback_slot,
+        "face_dir": face_dir,
+    }
+
+
+def collect_voxel_edit_targets_direct(context, event, obj, action, brush_size, cells, face_slots, fallback_slot):
     hit_obj, face_index, _, _ = raycast_active_face_details(context, event)
     if hit_obj is None or face_index is None:
-        return 0
+        return {}
+
+    mesh = hit_obj.data
+    cell = get_voxel_cell_key_from_mesh(mesh, face_index)
+    face_dir = get_face_attribute_value(mesh, "mv_face_dir", face_index)
+    direction_vectors = get_voxel_cell_face_vectors()
+    if face_dir < 0 or face_dir >= len(direction_vectors):
+        return {}
+
+    touched = {}
+    face_offset = direction_vectors[face_dir]
+    for brush_offset in get_grid_brush_offsets_for_face(face_dir, brush_size):
+        source_cell = (
+            cell[0] + brush_offset[0],
+            cell[1] + brush_offset[1],
+            cell[2] + brush_offset[2],
+        )
+        if action == 'REMOVE':
+            if source_cell in cells:
+                touched[source_cell] = None
+            continue
+
+        if source_cell not in cells:
+            continue
+        target = (
+            source_cell[0] + face_offset[0],
+            source_cell[1] + face_offset[1],
+            source_cell[2] + face_offset[2],
+        )
+        if target in cells:
+            continue
+        touched[target] = get_slot_for_new_voxel_cell(
+            cells,
+            face_slots,
+            target,
+            source_cell=source_cell,
+            source_face_dir=face_dir,
+            fallback_slot=fallback_slot,
+        )
+    return touched
+
+
+def edit_voxel_cells_with_brush(context, event, obj, action, slot_index, brush_size, cells=None, face_slots=None, rebuild=True, face_centers_world=None, fast_direct=True):
 
     origin = get_stored_voxel_origin(obj)
     voxel_size = float(obj.get("mv_voxel_size", 0.0))
     if origin is None or voxel_size <= 0.0:
         return 0
 
-    cells = deserialize_voxel_cells(obj)
+    if cells is None:
+        cells = deserialize_voxel_cells(obj)
     if not cells:
         return 0
+    if face_slots is None:
+        face_slots = collect_voxel_face_slots_from_mesh(obj, cells)
 
-    mesh = obj.data
-    radius = max(1.0, float(brush_size))
-    face_indices = {face_index}
-
-    if radius > 1.0:
-        region, region_3d, mouse_coord = get_mouse_region_coord(context, event)
-        if region is not None:
-            radius_sq = radius * radius
-            for poly in mesh.polygons:
-                center = hit_obj.matrix_world @ get_polygon_center(mesh, poly)
-                screen_coord = view3d_utils.location_3d_to_region_2d(region, region_3d, center)
-                if screen_coord is None:
-                    continue
-                dx = screen_coord.x - mouse_coord[0]
-                dy = screen_coord.y - mouse_coord[1]
-                if (dx * dx) + (dy * dy) <= radius_sq:
-                    face_indices.add(poly.index)
-
-    direction_vectors = get_voxel_cell_face_vectors()
-    touched = set()
-    changed = False
-
-    for current_face_index in face_indices:
-        cell = (
-            get_face_attribute_value(mesh, "mv_cell_i", current_face_index),
-            get_face_attribute_value(mesh, "mv_cell_j", current_face_index),
-            get_face_attribute_value(mesh, "mv_cell_k", current_face_index),
+    if fast_direct:
+        touched = collect_voxel_edit_targets_direct(
+            context,
+            event,
+            obj,
+            action,
+            brush_size,
+            cells,
+            face_slots,
+            slot_index,
         )
-        face_dir = get_face_attribute_value(mesh, "mv_face_dir", current_face_index)
-        if face_dir < 0 or face_dir >= len(direction_vectors):
-            continue
+    else:
+        face_indices = collect_brush_face_indices(context, event, obj, brush_size, face_centers_world)
+        if not face_indices:
+            return 0
 
-        if action == 'REMOVE':
-            touched.add(cell)
-        elif action == 'ADD':
-            offset = direction_vectors[face_dir]
-            touched.add((cell[0] + offset[0], cell[1] + offset[1], cell[2] + offset[2]))
+        mesh = obj.data
+        direction_vectors = get_voxel_cell_face_vectors()
+        touched = {}
+        for current_face_index in face_indices:
+            cell = (
+                get_face_attribute_value(mesh, "mv_cell_i", current_face_index),
+                get_face_attribute_value(mesh, "mv_cell_j", current_face_index),
+                get_face_attribute_value(mesh, "mv_cell_k", current_face_index),
+            )
+            face_dir = get_face_attribute_value(mesh, "mv_face_dir", current_face_index)
+            if face_dir < 0 or face_dir >= len(direction_vectors):
+                continue
 
-    for coord in touched:
+            if action == 'REMOVE':
+                touched[cell] = None
+            elif action == 'ADD':
+                offset = direction_vectors[face_dir]
+                target = (cell[0] + offset[0], cell[1] + offset[1], cell[2] + offset[2])
+                touched[target] = get_slot_for_new_voxel_cell(
+                    cells,
+                    face_slots,
+                    target,
+                    source_cell=cell,
+                    source_face_dir=face_dir,
+                    fallback_slot=slot_index,
+                )
+
+    if not touched:
+        return 0
+
+    changed = False
+    for coord, new_slot in touched.items():
         if action == 'REMOVE':
             if coord in cells:
                 del cells[coord]
                 changed = True
         elif action == 'ADD':
             if coord not in cells:
-                cells[coord] = int(slot_index)
+                cells[coord] = int(new_slot)
                 changed = True
 
     if not changed:
         return 0
 
-    rebuild_voxel_mesh_from_cells(obj, origin, voxel_size, cells)
+    if rebuild:
+        rebuild_voxel_mesh_from_cells(obj, origin, voxel_size, cells, face_slots)
     return len(touched)
 
 
@@ -981,7 +1658,7 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
 
     texture_source_name: StringProperty(
         name="Source Override",
-        description="Optional source object name for texture transfer. Leave empty to infer the original object automatically",
+        description="Optional source object name for texture transfer. Leave empty to use the _body copy automatically",
         default="",
     )
 
@@ -1139,6 +1816,12 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
         min=1,
         soft_max=80,
         max=300,
+    )
+
+    voxel_brush_debug: BoolProperty(
+        name="Debug Brush Timing",
+        description="Print Voxel Brush timing samples to the console and status bar",
+        default=False,
     )
 
     outer_skin_mm: FloatProperty(
@@ -4470,7 +5153,8 @@ class MINIATUREVOXELER_OT_block_remesh(Operator):
 
     def execute(self, context):
         settings = context.scene.miniature_voxeler_settings
-        source_obj = get_voxel_source_object(settings)
+        building_obj = get_building_object(settings)
+        source_obj = ensure_building_body_object(context, settings)
         if source_obj is None:
             self.report({'ERROR'}, "Pick a Building mesh first.")
             return {'CANCELLED'}
@@ -4478,20 +5162,19 @@ class MINIATUREVOXELER_OT_block_remesh(Operator):
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
 
+        source_obj.hide_set(False)
         root_name = get_root_name(source_obj.name)
         new_obj = duplicate_object(context, source_obj, get_blocks_name(root_name))
         set_metadata(new_obj, root_name, source_obj.name)
 
         origin, voxel_size, cells = generate_voxel_cells_from_object(context, source_obj, settings)
         rebuild_voxel_mesh_from_cells(new_obj, origin, voxel_size, cells)
-        building_copy_obj = get_building_copy_object(settings)
-        if building_copy_obj is not None and source_obj == building_copy_obj:
-            remove_object_if_exists(building_copy_obj)
-        else:
-            source_obj.hide_set(True)
+        source_obj.hide_set(True)
+        if building_obj is not None:
+            building_obj.hide_set(True)
         set_active_object(context, new_obj)
         voxel_size_mm = voxel_size * context.scene.unit_settings.scale_length * 1000.0
-        self.report({'INFO'}, f"Created voxel object: {new_obj.name} | {len(cells)} cubes | {voxel_size_mm:.3f} mm")
+        self.report({'INFO'}, f"Created voxel object: {new_obj.name} from {source_obj.name} | {len(cells)} cubes | {voxel_size_mm:.3f} mm")
         return {'FINISHED'}
 
 
@@ -4558,9 +5241,15 @@ class MINIATUREVOXELER_OT_transfer_texture(Operator):
             return {'CANCELLED'}
 
         source_obj = get_texture_source_object(settings)
+        if source_obj is None and not settings.texture_source_name.strip():
+            source_obj = ensure_building_body_object(context, settings)
 
         if source_obj is None:
-            self.report({'ERROR'}, "Pick a Building mesh or enter a valid Source Override.")
+            self.report({'ERROR'}, "No _body source found for texture transfer. Run Voxelize Building again, or enter a valid Source Override.")
+            return {'CANCELLED'}
+
+        if building_obj is not None and source_obj == building_obj:
+            self.report({'ERROR'}, "Texture transfer must use the _body copy, not the original Building.")
             return {'CANCELLED'}
 
         if source_obj == target_obj:
@@ -4576,10 +5265,16 @@ class MINIATUREVOXELER_OT_transfer_texture(Operator):
 
         scene = context.scene
         old_engine = scene.render.engine
-        should_rehide_source = (building_obj is not None and source_obj == building_obj)
+        source_was_hidden = source_obj.hide_get()
+        target_was_hidden = target_obj.hide_get()
+        building_was_hidden = building_obj.hide_get() if building_obj is not None else None
 
         try:
             scene.render.engine = 'CYCLES'
+            source_obj.hide_set(False)
+            target_obj.hide_set(False)
+            if building_obj is not None and building_obj != source_obj:
+                building_obj.hide_set(True)
 
             bake = scene.render.bake
             if hasattr(bake, "use_selected_to_active"):
@@ -4609,15 +5304,19 @@ class MINIATUREVOXELER_OT_transfer_texture(Operator):
                 pass
 
         except Exception as e:
-            if should_rehide_source:
-                source_obj.hide_set(True)
+            source_obj.hide_set(source_was_hidden)
+            target_obj.hide_set(target_was_hidden)
+            if building_obj is not None and building_was_hidden is not None:
+                building_obj.hide_set(building_was_hidden or True)
             scene.render.engine = old_engine
             self.report({'ERROR'}, f"Texture transfer failed: {str(e)}")
             return {'CANCELLED'}
 
         scene.render.engine = old_engine
-        if should_rehide_source:
-            source_obj.hide_set(True)
+        source_obj.hide_set(source_was_hidden)
+        target_obj.hide_set(target_was_hidden)
+        if building_obj is not None and building_was_hidden is not None:
+            building_obj.hide_set(building_was_hidden or True)
         set_active_object(context, target_obj)
 
         self.report({'INFO'}, f"Texture baked from {source_obj.name} to {target_obj.name}")
@@ -4686,6 +5385,7 @@ class MINIATUREVOXELER_OT_lego_color(Operator):
 
         sync_slot_palette_properties(settings, palette)
         rebuild_materials_from_assignments(obj, settings, assignments, len(palette))
+        sync_voxel_color_state_from_mesh(obj)
 
         self.report(
             {'INFO'},
@@ -4733,6 +5433,7 @@ class MINIATUREVOXELER_OT_smooth_lego_color(Operator):
             settings.lego_smooth_passes,
             settings.lego_smooth_min_neighbors,
         )
+        sync_voxel_color_state_from_mesh(obj)
         self.report({'INFO'}, f"Smooth Lego Color updated {changed_count} face assignment(s).")
         return {'FINISHED'}
 
@@ -5122,6 +5823,554 @@ class MINIATUREVOXELER_OT_edit_voxel_cells(Operator):
             if changed > 0:
                 return {'RUNNING_MODAL'}
 
+        return {'PASS_THROUGH'}
+
+
+# ------------------------------------------------------------
+# Operator 7c: Unified Paint / Cube Brush
+# ------------------------------------------------------------
+
+class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
+    bl_idname = "object.miniature_voxeler_voxel_brush_tool"
+    bl_label = "Voxel Brush"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    mode: EnumProperty(
+        name="Mode",
+        items=[
+            ('PAINT', "Paint", "Paint visible voxel faces"),
+            ('ADD', "Add Cubes", "Add cubes on the voxel grid"),
+            ('REMOVE', "Remove Cubes", "Remove cubes from the voxel grid"),
+        ],
+        default='PAINT',
+    )
+    slot_index: IntProperty(default=0, min=0, max=3)
+
+    _active_tool = None
+
+    @staticmethod
+    def draw_brush_overlay(operator, context):
+        MINIATUREVOXELER_OT_paint_lego_slot.draw_brush_overlay(operator, context)
+
+    @staticmethod
+    def draw_voxel_overlay(operator, context):
+        start_time = perf_counter()
+        settings = getattr(context.scene, "miniature_voxeler_settings", None)
+        if settings is None:
+            return
+        obj = get_blocks_object(settings)
+        if obj is None:
+            return
+
+        hover = getattr(operator, "_hover_edit", None)
+        if hover is not None:
+            target_coords = get_grid_brush_target_coords(
+                hover["target"],
+                hover.get("face_dir", 4),
+                settings.lego_paint_brush_size,
+            )
+            face_coords = []
+            wire_coords = []
+            inflate = 0.025
+            for target_coord in target_coords:
+                face_coords.extend(get_voxel_cell_face_coords(obj, target_coord, inflate))
+                wire_coords.extend(get_voxel_cell_wire_coords(obj, target_coord, inflate))
+            fill_color = (0.15, 1.0, 0.35, 0.28) if operator.mode == 'ADD' else (1.0, 0.08, 0.04, 0.32)
+            wire_color = (0.2, 1.0, 0.35, 0.95) if operator.mode == 'ADD' else (1.0, 0.14, 0.08, 0.95)
+            draw_voxel_transparent_cells(obj, face_coords, fill_color)
+            draw_voxel_wire_cells(obj, wire_coords, wire_color)
+
+        pending_adds = list(getattr(operator, "_pending_added", set()))
+        if pending_adds:
+            face_coords = []
+            wire_coords = []
+            inflate = 0.018
+            for coord in pending_adds:
+                face_coords.extend(get_voxel_cell_face_coords(obj, coord, inflate))
+                wire_coords.extend(get_voxel_cell_wire_coords(obj, coord, inflate))
+            draw_voxel_transparent_cells(obj, face_coords, (0.1, 0.65, 1.0, 0.22))
+            draw_voxel_wire_cells(obj, wire_coords, (0.15, 0.85, 1.0, 0.65))
+
+        pending_removes = list(getattr(operator, "_pending_removed", set()))
+        if pending_removes:
+            face_coords = []
+            wire_coords = []
+            inflate = 0.025
+            for coord in pending_removes:
+                face_coords.extend(get_voxel_cell_face_coords(obj, coord, inflate))
+                wire_coords.extend(get_voxel_cell_wire_coords(obj, coord, inflate))
+            draw_voxel_transparent_cells(obj, face_coords, (1.0, 0.05, 0.03, 0.26))
+            draw_voxel_wire_cells(obj, wire_coords, (1.0, 0.15, 0.12, 0.65))
+        operator.record_timing("overlay", perf_counter() - start_time)
+
+    @classmethod
+    def poll(cls, context):
+        return has_blocks_object(context)
+
+    def update_modal_cursor(self, context, event=None):
+        if context.window is None:
+            return
+
+        if getattr(self, "_is_picking_color", False):
+            cursor = 'EYEDROPPER'
+        elif self.mode == 'PAINT':
+            cursor = 'PAINT_BRUSH'
+        elif self.mode == 'ADD':
+            cursor = 'CROSSHAIR'
+        else:
+            cursor = 'KNIFE'
+
+        if getattr(self, "_current_cursor", None) != cursor:
+            context.window.cursor_modal_set(cursor)
+            self._current_cursor = cursor
+
+    def add_draw_handler(self, context):
+        if getattr(self, "_draw_handler", None) is None:
+            self._draw_handler = bpy.types.SpaceView3D.draw_handler_add(
+                self.draw_brush_overlay,
+                (self, context),
+                'WINDOW',
+                'POST_PIXEL',
+            )
+        if getattr(self, "_voxel_draw_handler", None) is None:
+            self._voxel_draw_handler = bpy.types.SpaceView3D.draw_handler_add(
+                self.draw_voxel_overlay,
+                (self, context),
+                'WINDOW',
+                'POST_VIEW',
+            )
+
+    def remove_draw_handler(self, context):
+        if getattr(self, "_draw_handler", None) is not None:
+            bpy.types.SpaceView3D.draw_handler_remove(self._draw_handler, 'WINDOW')
+            self._draw_handler = None
+        if getattr(self, "_voxel_draw_handler", None) is not None:
+            bpy.types.SpaceView3D.draw_handler_remove(self._voxel_draw_handler, 'WINDOW')
+            self._voxel_draw_handler = None
+        if context.area:
+            context.area.tag_redraw()
+
+    def restore_modal_cursor(self, context):
+        if context.window is not None and getattr(self, "_current_cursor", None) is not None:
+            context.window.cursor_modal_restore()
+            self._current_cursor = None
+
+    def record_timing(self, label, elapsed):
+        if not getattr(self, "_debug_enabled", False):
+            return
+        samples = self._profile_samples.setdefault(label, [0, 0.0, 0.0])
+        samples[0] += 1
+        samples[1] += elapsed
+        samples[2] = max(samples[2], elapsed)
+
+    def maybe_report_timing(self, context):
+        if not getattr(self, "_debug_enabled", False):
+            return
+        now = perf_counter()
+        if now - getattr(self, "_last_profile_report", 0.0) < 1.5:
+            return
+        if not self._profile_samples:
+            return
+        parts = []
+        for label, (count, total, maximum) in sorted(self._profile_samples.items()):
+            if count:
+                parts.append(f"{label}: avg {total * 1000.0 / count:.2f}ms max {maximum * 1000.0:.2f}ms n={count}")
+        message = "Voxel Brush timing | " + " | ".join(parts)
+        print(message)
+        self.report({'INFO'}, message[:240])
+        self._profile_samples = {}
+        self._last_profile_report = now
+
+    def flush_pending_voxel_rebuild(self, context, obj=None):
+        if not getattr(self, "_pending_rebuild", False):
+            return 0
+        start_time = perf_counter()
+        settings = context.scene.miniature_voxeler_settings
+        obj = obj or get_blocks_object(settings)
+        if obj is None:
+            return 0
+        origin = get_stored_voxel_origin(obj)
+        voxel_size = float(obj.get("mv_voxel_size", 0.0))
+        if origin is None or voxel_size <= 0.0:
+            return 0
+        rebuild_voxel_mesh_from_cells(obj, origin, voxel_size, self._cells, self._face_slots, store_state=False)
+        self._face_slots = collect_voxel_face_slots_from_mesh(obj, self._cells)
+        self._face_centers_world = get_voxel_face_centers_world(obj)
+        self._grid_cache = build_voxel_grid_cache(obj, self._cells)
+        self._pending_added.clear()
+        self._pending_removed.clear()
+        self._pending_rebuild = False
+        self._last_visible_rebuild_time = perf_counter()
+        self.record_timing("rebuild", perf_counter() - start_time)
+        return 1
+
+    def commit_pending_voxel_edits(self, context, obj=None, report=True):
+        committed = self.flush_pending_voxel_rebuild(context, obj)
+        if committed:
+            self._last_applied_target = None
+            self._drag_face_dir = None
+            self._drag_plane_coord = None
+            if report:
+                self.report({'INFO'}, "Voxel edits committed. Brush remains active.")
+        elif report:
+            self.report({'INFO'}, "No queued voxel edits to commit.")
+        return committed
+
+    def maybe_flush_visible_voxel_rebuild(self, context, obj):
+        if not getattr(self, "_pending_rebuild", False):
+            return 0
+        last_time = getattr(self, "_last_visible_rebuild_time", 0.0)
+        if perf_counter() - last_time < 0.12:
+            return 0
+        return self.flush_pending_voxel_rebuild(context, obj)
+
+    def finish_modal(self, context, message=None):
+        obj = get_blocks_object(context.scene.miniature_voxeler_settings)
+        self.flush_pending_voxel_rebuild(context, obj)
+        if obj is not None and getattr(self, "_face_slots", None) is not None:
+            store_voxel_face_slots(obj, self._face_slots)
+            self._cells = sync_voxel_cell_slots_from_face_slots(self._cells, self._face_slots)
+            origin = get_stored_voxel_origin(obj)
+            voxel_size = float(obj.get("mv_voxel_size", 0.0))
+            if origin is not None and voxel_size > 0.0:
+                store_voxel_state(obj, origin, voxel_size, self._cells)
+        if type(self)._active_tool is self:
+            type(self)._active_tool = None
+        self.remove_draw_handler(context)
+        self.restore_modal_cursor(context)
+        self._is_editing = False
+        if message:
+            self.report({'INFO'}, message)
+        return {'FINISHED'}
+
+    def cancel_modal(self, context):
+        return self.finish_modal(context, "Voxel brush finished.")
+
+    def apply_hover_edit(self):
+        hover = getattr(self, "_hover_edit", None)
+        if hover is None:
+            return 0
+        target_coords = get_grid_brush_target_coords(
+            hover["target"],
+            hover.get("face_dir", 4),
+            getattr(self, "_active_brush_size", 1),
+        )
+        signature = (self.mode, tuple(sorted(target_coords)))
+        if getattr(self, "_last_applied_target", None) == signature:
+            return 0
+
+        changed_count = 0
+        if self.mode == 'ADD':
+            direction = get_voxel_cell_face_vectors()[hover.get("face_dir", 4)]
+            for target in target_coords:
+                if target in self._cells:
+                    continue
+                source_cell = (
+                    target[0] - direction[0],
+                    target[1] - direction[1],
+                    target[2] - direction[2],
+                )
+                if source_cell not in self._cells:
+                    continue
+                slot = get_slot_for_new_voxel_cell(
+                    self._cells,
+                    self._face_slots,
+                    target,
+                    source_cell=source_cell,
+                    source_face_dir=hover.get("face_dir"),
+                    fallback_slot=hover.get("fallback_slot", self.slot_index),
+                )
+                self._cells[target] = int(slot)
+                expand_voxel_grid_cache(getattr(self, "_grid_cache", None), target)
+                self._pending_added.add(target)
+                self._pending_removed.discard(target)
+                changed_count += 1
+        elif self.mode == 'REMOVE':
+            for target in target_coords:
+                if target not in self._cells:
+                    continue
+                del self._cells[target]
+                self._pending_removed.add(target)
+                self._pending_added.discard(target)
+                for key in list(self._face_slots.keys()):
+                    if key[:3] == target:
+                        del self._face_slots[key]
+                changed_count += 1
+        else:
+            return 0
+
+        if changed_count == 0:
+            return 0
+
+        self._last_applied_target = signature
+        self._pending_rebuild = True
+        return changed_count
+
+    def invoke(self, context, event):
+        settings = context.scene.miniature_voxeler_settings
+        obj = get_blocks_object(settings)
+        if obj is None:
+            self.report({'ERROR'}, "Run Step 2 Block Remesh first so the _Blocks object exists.")
+            return {'CANCELLED'}
+        if "mv_voxel_cells_json" not in obj:
+            self.report({'ERROR'}, "This _Blocks object was not generated by the custom voxelizer.")
+            return {'CANCELLED'}
+        if self.mode == 'PAINT' and self.slot_index >= settings.lego_color_count:
+            self.report({'ERROR'}, "This paint slot is not enabled by Number of Colors.")
+            return {'CANCELLED'}
+        if context.area is None or context.area.type != 'VIEW_3D':
+            self.report({'ERROR'}, "Start Voxel Brush from a 3D View.")
+            return {'CANCELLED'}
+
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        ensure_slot_palette_materials(obj, settings)
+
+        previous = type(self)._active_tool
+        if previous is not None and previous is not self and not getattr(previous, "_cancel_requested", False):
+            if previous.mode == self.mode and previous.slot_index == self.slot_index:
+                previous._cancel_requested = True
+                previous._cancel_message = "Voxel brush finished."
+                return {'FINISHED'}
+            if self.mode == 'PAINT':
+                previous.flush_pending_voxel_rebuild(context, obj)
+            previous.mode = self.mode
+            previous.slot_index = self.slot_index
+            previous._is_editing = False
+            previous._is_picking_color = False
+            previous._is_resizing_brush = False
+            previous._hover_edit = None
+            if self.mode != 'PAINT':
+                previous._face_centers_world = []
+            if self.mode == 'PAINT':
+                settings.selected_lego_palette_slot = self.slot_index
+                previous._face_centers_world = get_voxel_face_centers_world(obj)
+            previous.update_modal_cursor(context, event)
+            self.report({'INFO'}, f"Voxel Brush switched to {self.mode.lower().replace('_', ' ')}.")
+            return {'FINISHED'}
+
+        if previous is not None and previous is not self:
+            previous._cancel_requested = True
+
+        self._cancel_requested = False
+        self._cancel_message = None
+        self._is_editing = False
+        self._is_picking_color = False
+        self._is_resizing_brush = False
+        self._pending_rebuild = False
+        self._last_visible_rebuild_time = 0.0
+        self._pending_added = set()
+        self._pending_removed = set()
+        self._last_applied_target = None
+        self._drag_face_dir = None
+        self._drag_plane_coord = None
+        self._hover_edit = None
+        self._debug_enabled = bool(settings.voxel_brush_debug)
+        self._profile_samples = {}
+        self._last_profile_report = perf_counter()
+        self._mouse_region_coord = None
+        self._draw_handler = None
+        self._voxel_draw_handler = None
+        self._current_cursor = None
+        self._cells = deserialize_voxel_cells(obj)
+        self._grid_cache = build_voxel_grid_cache(obj, self._cells)
+        self._face_slots = deserialize_voxel_face_slots(obj)
+        if not self._face_slots and self.mode == 'PAINT':
+            self._face_slots = collect_voxel_face_slots_from_mesh(obj, self._cells)
+        self._face_centers_world = get_voxel_face_centers_world(obj) if self.mode == 'PAINT' else []
+        if self.mode == 'PAINT':
+            settings.selected_lego_palette_slot = self.slot_index
+
+        type(self)._active_tool = self
+        self.add_draw_handler(context)
+        context.window_manager.modal_handler_add(self)
+        self.update_modal_cursor(context, event)
+        self.report({'INFO'}, "Voxel Brush active. Use the panel to switch Paint/Add/Remove; left-drag edits, I picks color, F resizes, right-click or Esc stops.")
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if context.area:
+            context.area.tag_redraw()
+
+        if self._cancel_requested:
+            return self.finish_modal(context, getattr(self, "_cancel_message", None))
+
+        if not self._is_resizing_brush and is_event_in_view3d_ui_region(context, event):
+            self._mouse_region_coord = None
+            return {'PASS_THROUGH'}
+
+        if self._is_resizing_brush:
+            self._mouse_region_coord = self._brush_resize_region_coord
+            mouse_coord = self._brush_resize_region_coord
+        else:
+            _, _, mouse_coord = get_mouse_region_coord(context, event)
+            self._mouse_region_coord = mouse_coord
+
+        self.update_modal_cursor(context, event)
+        settings = context.scene.miniature_voxeler_settings
+        obj = get_blocks_object(settings)
+        if obj is None:
+            return self.cancel_modal(context)
+
+        self._active_brush_size = settings.lego_paint_brush_size
+        if (
+            self.mode == 'ADD' and
+            self._is_editing and
+            self._drag_face_dir is not None and
+            mouse_coord is not None
+        ):
+            hover_start = perf_counter()
+            self._hover_edit = get_voxel_plane_edit_target(
+                context,
+                event,
+                obj,
+                self._cells,
+                settings.selected_lego_palette_slot,
+                self._grid_cache,
+                self._drag_face_dir,
+                self._drag_plane_coord,
+            )
+            self.record_timing("hover", perf_counter() - hover_start)
+        elif self.mode in {'ADD', 'REMOVE'} and mouse_coord is not None:
+            hover_start = perf_counter()
+            self._hover_edit = get_voxel_cursor_edit_target(
+                context,
+                event,
+                obj,
+                self.mode,
+                self._cells,
+                self._face_slots,
+                settings.selected_lego_palette_slot,
+                self._grid_cache,
+            )
+            self.record_timing("hover", perf_counter() - hover_start)
+        elif self.mode == 'PAINT':
+            self._hover_edit = None
+
+        if mouse_coord is None and event.type in {'LEFTMOUSE', 'MIDDLEMOUSE', 'RIGHTMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}:
+            return {'PASS_THROUGH'}
+
+        if self._is_resizing_brush:
+            if event.type == 'MOUSEMOVE':
+                distance = hypot(event.mouse_x - self._brush_resize_start_x, event.mouse_y - self._brush_resize_start_y)
+                settings.lego_paint_brush_size = max(1, min(300, int(distance)))
+                return {'RUNNING_MODAL'}
+            if event.type in {'LEFTMOUSE', 'RET', 'NUMPAD_ENTER', 'SPACE'} and event.value == 'PRESS':
+                self._is_resizing_brush = False
+                self.report({'INFO'}, f"Brush size: {settings.lego_paint_brush_size}")
+                return {'RUNNING_MODAL'}
+            if event.type in {'RIGHTMOUSE', 'ESC'} and event.value == 'PRESS':
+                settings.lego_paint_brush_size = self._brush_resize_start_size
+                self._is_resizing_brush = False
+                return {'RUNNING_MODAL'}
+            return {'RUNNING_MODAL'}
+
+        if event.type == 'SPACE' and event.value == 'PRESS' and self.mode in {'ADD', 'REMOVE'}:
+            self._is_editing = False
+            self.commit_pending_voxel_edits(context, obj)
+            return {'RUNNING_MODAL'}
+
+        if event.type in {'RIGHTMOUSE', 'ESC'}:
+            if self._is_picking_color:
+                self._is_picking_color = False
+                self.update_modal_cursor(context, event)
+                return {'RUNNING_MODAL'}
+            return self.finish_modal(context, "Voxel brush finished.")
+
+        if event.type == 'F' and event.value == 'PRESS':
+            self._is_resizing_brush = True
+            self._brush_resize_start_x = event.mouse_x
+            self._brush_resize_start_y = event.mouse_y
+            self._brush_resize_start_size = settings.lego_paint_brush_size
+            _, _, self._brush_resize_region_coord = get_mouse_region_coord(context, event)
+            self.report({'INFO'}, "Move mouse to resize brush, left-click confirms, right-click cancels.")
+            return {'RUNNING_MODAL'}
+
+        if event.type == 'I' and event.value == 'PRESS':
+            self.flush_pending_voxel_rebuild(context, obj)
+            self._is_picking_color = True
+            self._is_editing = False
+            self.update_modal_cursor(context, event)
+            self.report({'INFO'}, "Color picker active. Click a face to pick its slot.")
+            return {'RUNNING_MODAL'}
+
+        if self._is_picking_color:
+            if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+                hit_obj, face_index = raycast_active_face(context, event)
+                if hit_obj is not None and face_index is not None:
+                    picked_slot = hit_obj.data.polygons[face_index].material_index
+                    if 0 <= picked_slot < settings.lego_color_count:
+                        self.slot_index = picked_slot
+                        settings.selected_lego_palette_slot = picked_slot
+                        self.mode = 'PAINT'
+                        self._is_picking_color = False
+                        self.update_modal_cursor(context, event)
+                        self.report({'INFO'}, f"Picked slot {self.slot_index + 1}.")
+                return {'RUNNING_MODAL'}
+            return {'RUNNING_MODAL'}
+
+        if event.type in {'P', 'A', 'X'} and event.value == 'PRESS':
+            if event.type == 'P':
+                self.flush_pending_voxel_rebuild(context, obj)
+            if event.type == 'P':
+                self.mode = 'PAINT'
+                self._face_centers_world = get_voxel_face_centers_world(obj)
+            elif event.type == 'A':
+                self.mode = 'ADD'
+                self._face_centers_world = []
+            else:
+                self.mode = 'REMOVE'
+                self._face_centers_world = []
+            self._hover_edit = None
+            self._drag_face_dir = None
+            self._drag_plane_coord = None
+            self.update_modal_cursor(context, event)
+            return {'RUNNING_MODAL'}
+
+        if event.type == 'LEFTMOUSE':
+            if event.value == 'PRESS':
+                if self.mode == 'PAINT':
+                    self.flush_pending_voxel_rebuild(context, obj)
+                elif self.mode == 'ADD' and self._hover_edit is not None:
+                    self._drag_face_dir = self._hover_edit.get("face_dir")
+                    self._drag_plane_coord = self._hover_edit["target"][get_axis_for_face_dir(self._drag_face_dir)]
+                elif self.mode == 'REMOVE':
+                    self._drag_face_dir = None
+                    self._drag_plane_coord = None
+                self._is_editing = True
+                self._last_applied_target = None
+            elif event.value == 'RELEASE':
+                self._is_editing = False
+                if self.mode == 'PAINT':
+                    self.flush_pending_voxel_rebuild(context, obj)
+                self._drag_face_dir = None
+                self._drag_plane_coord = None
+                self._last_applied_target = None
+                return {'RUNNING_MODAL'}
+
+        if self._is_editing and event.type in {'LEFTMOUSE', 'MOUSEMOVE'}:
+            if self.mode == 'PAINT':
+                changed = paint_faces_with_brush(
+                    context,
+                    event,
+                    obj,
+                    self.slot_index,
+                    settings.lego_paint_brush_size,
+                    self._face_slots,
+                    commit_face_slots=False,
+                    face_centers_world=self._face_centers_world,
+                )
+                if changed:
+                    return {'RUNNING_MODAL'}
+            else:
+                edit_start = perf_counter()
+                changed = self.apply_hover_edit()
+                self.record_timing("edit", perf_counter() - edit_start)
+                if changed:
+                    self.maybe_report_timing(context)
+                    return {'RUNNING_MODAL'}
+
+        self.maybe_report_timing(context)
         return {'PASS_THROUGH'}
 
 
@@ -6497,19 +7746,12 @@ class MINIATUREVOXELER_PT_panel(Panel):
             col.prop(settings, "lego_color_assign_mode")
             box.operator("object.miniature_voxeler_lego_color", text="Create Color Slots", icon='MATERIAL')
 
-            smooth_box = box.box()
-            smooth_box.label(text="Smooth Colors")
-            smooth_col = smooth_box.column(align=True)
-            smooth_col.prop(settings, "lego_smooth_weight")
-            smooth_col.prop(settings, "lego_smooth_passes")
-            smooth_col.prop(settings, "lego_smooth_min_neighbors")
-            smooth_box.operator("object.miniature_voxeler_smooth_lego_color", icon='MOD_SMOOTH')
-
-            palette_box = box.box()
-            palette_box.label(text="Paint And Cleanup")
-            palette_box.prop(settings, "lego_paint_brush_size")
-            palette_col = palette_box.column(align=True)
-            active_painter = MINIATUREVOXELER_OT_paint_lego_slot._active_painter
+            # Step 2.5 keeps face painting and cube editing in one always-available brush.
+            box = self.draw_step_box(layout, 'BUILDING', "2.5 Voxel Brush Editing")
+            box.prop(settings, "lego_paint_brush_size")
+            box.prop(settings, "voxel_brush_debug")
+            palette_col = box.column(align=True)
+            active_brush = MINIATUREVOXELER_OT_voxel_brush_tool._active_tool
 
             for slot_index in range(settings.lego_color_count):
                 row = palette_col.row(align=True)
@@ -6518,31 +7760,41 @@ class MINIATUREVOXELER_PT_panel(Panel):
                 swatch.prop(settings, f"lego_palette_slot_color_{slot_index + 1}", text="")
                 row.prop(settings, f"lego_palette_slot_{slot_index + 1}")
                 is_active_paint_slot = (
-                    active_painter is not None and
-                    not getattr(active_painter, "_cancel_requested", False) and
-                    active_painter.slot_index == slot_index
+                    active_brush is not None and
+                    not getattr(active_brush, "_cancel_requested", False) and
+                    active_brush.mode == 'PAINT' and
+                    active_brush.slot_index == slot_index
                 )
                 icon = 'RADIOBUT_ON' if is_active_paint_slot else 'RADIOBUT_OFF'
                 op = row.operator(
-                    "object.miniature_voxeler_paint_lego_slot",
+                    "object.miniature_voxeler_voxel_brush_tool",
                     text="",
                     icon=icon,
                     depress=is_active_paint_slot,
                 )
+                op.mode = 'PAINT'
                 op.slot_index = slot_index
 
-            palette_box.label(text="Paint: left-drag paints, I picks a slot, F changes brush size.")
-            voxel_box = palette_box.box()
-            voxel_box.label(text="Cube Cleanup")
-            voxel_row = voxel_box.row(align=True)
-            add_op = voxel_row.operator("object.miniature_voxeler_edit_voxel_cells", text="Add Cubes", icon='ADD')
-            add_op.action = 'ADD'
-            remove_op = voxel_row.operator("object.miniature_voxeler_edit_voxel_cells", text="Remove Cubes", icon='REMOVE')
-            remove_op.action = 'REMOVE'
-            voxel_box.label(text="Uses the same brush size as paint mode.")
+            voxel_row = box.row(align=True)
+            is_add_active = active_brush is not None and not getattr(active_brush, "_cancel_requested", False) and active_brush.mode == 'ADD'
+            is_remove_active = active_brush is not None and not getattr(active_brush, "_cancel_requested", False) and active_brush.mode == 'REMOVE'
+            add_op = voxel_row.operator("object.miniature_voxeler_voxel_brush_tool", text="Add Cubes", icon='ADD', depress=is_add_active)
+            add_op.mode = 'ADD'
+            add_op.slot_index = settings.selected_lego_palette_slot
+            remove_op = voxel_row.operator("object.miniature_voxeler_voxel_brush_tool", text="Remove Cubes", icon='REMOVE', depress=is_remove_active)
+            remove_op.mode = 'REMOVE'
+            remove_op.slot_index = settings.selected_lego_palette_slot
 
-            # Step 2.5 exports the colored building shell pieces for downstream use.
-            box = self.draw_step_box(layout, 'BUILDING', "2.5 Export Pieces")
+            # Step 2.6 smooths material assignments after manual edits if needed.
+            box = self.draw_step_box(layout, 'BUILDING', "2.6 Smooth Colors")
+            smooth_col = box.column(align=True)
+            smooth_col.prop(settings, "lego_smooth_weight")
+            smooth_col.prop(settings, "lego_smooth_passes")
+            smooth_col.prop(settings, "lego_smooth_min_neighbors")
+            box.operator("object.miniature_voxeler_smooth_lego_color", icon='MOD_SMOOTH')
+
+            # Step 2.7 exports the colored building shell pieces for downstream use.
+            box = self.draw_step_box(layout, 'BUILDING', "2.7 Export Pieces")
             col = box.column(align=True)
             col.prop(settings, "color_skin_base_slot")
             col.prop(settings, "outer_skin_mm")
@@ -6575,6 +7827,7 @@ classes = (
     MINIATUREVOXELER_OT_smooth_lego_color,
     MINIATUREVOXELER_OT_paint_lego_slot,
     MINIATUREVOXELER_OT_edit_voxel_cells,
+    MINIATUREVOXELER_OT_voxel_brush_tool,
     MINIATUREVOXELER_OT_generate_color_skin,
     MINIATUREVOXELER_OT_prepare_platform_copy,
     MINIATUREVOXELER_OT_prepare_platform_walls_selection,
