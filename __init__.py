@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Miniature Voxeler",
     "author": "OpenAI",
-    "version": (3, 3, 0),
+    "version": (3, 3, 1),
     "blender": (5, 0, 1),
     "location": "3D View > Sidebar > Miniature Voxeler",
     "description": "Block remesh, transfer texture, create Lego-color face materials, and generate Lego skin meshes for miniature voxel workflows",
@@ -27,7 +27,7 @@ from bpy.props import (
     EnumProperty,
 )
 
-ADDON_VERSION_TEXT = "v.3.3.0"
+ADDON_VERSION_TEXT = "v.3.3.1"
 
 
 def srgb_channel_to_linear(value):
@@ -1189,6 +1189,16 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
         max=pi,
         subtype='ANGLE',
         precision=3,
+    )
+
+    platform_ring_gap_tolerance: FloatProperty(
+        name="Gap Tolerance",
+        description="Maximum XY gap stitched when storing manually selected upper-ring edges",
+        default=0.002,
+        min=0.0,
+        precision=6,
+        step=0.1,
+        unit='LENGTH',
     )
 
     platform_inner_thickness_mm: FloatProperty(
@@ -2541,6 +2551,175 @@ def get_ordered_loop_coords(obj, edge_indices):
         coords.pop()
 
     return coords
+
+
+def xy_distance_sq_coords(a, b):
+    return ((a[0] - b[0]) ** 2) + ((a[1] - b[1]) ** 2)
+
+
+def find_snap_cluster(clusters, coord, tolerance_sq):
+    best_index = None
+    best_distance = None
+    for index, cluster in enumerate(clusters):
+        distance = xy_distance_sq_coords(cluster["coord"], coord)
+        if distance <= tolerance_sq and (best_distance is None or distance < best_distance):
+            best_index = index
+            best_distance = distance
+    return best_index
+
+
+def get_or_create_snap_cluster(clusters, coord, tolerance_sq):
+    cluster_index = find_snap_cluster(clusters, coord, tolerance_sq)
+    if cluster_index is None:
+        clusters.append({
+            "coord": (float(coord[0]), float(coord[1]), float(coord[2])),
+            "count": 1,
+        })
+        return len(clusters) - 1
+
+    cluster = clusters[cluster_index]
+    count = cluster["count"]
+    current = cluster["coord"]
+    cluster["coord"] = (
+        ((current[0] * count) + float(coord[0])) / (count + 1),
+        ((current[1] * count) + float(coord[1])) / (count + 1),
+        ((current[2] * count) + float(coord[2])) / (count + 1),
+    )
+    cluster["count"] = count + 1
+    return cluster_index
+
+
+def get_graph_components(adjacency):
+    components = []
+    visited = set()
+    for node in adjacency:
+        if node in visited:
+            continue
+        stack = [node]
+        component = []
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            component.append(current)
+            for neighbor in adjacency.get(current, []):
+                if neighbor not in visited:
+                    stack.append(neighbor)
+        components.append(component)
+    return components
+
+
+def bridge_endpoint_gaps(adjacency, clusters, tolerance_sq):
+    endpoints = [node for node in adjacency if len(adjacency.get(node, [])) == 1]
+    bridged_count = 0
+    while len(endpoints) >= 2:
+        best_pair = None
+        best_distance = None
+        for index, node_a in enumerate(endpoints):
+            for node_b in endpoints[index + 1:]:
+                if node_b in adjacency[node_a]:
+                    continue
+                distance = xy_distance_sq_coords(clusters[node_a]["coord"], clusters[node_b]["coord"])
+                if distance <= tolerance_sq and (best_distance is None or distance < best_distance):
+                    best_pair = (node_a, node_b)
+                    best_distance = distance
+
+        if best_pair is None:
+            break
+
+        node_a, node_b = best_pair
+        adjacency[node_a].add(node_b)
+        adjacency[node_b].add(node_a)
+        bridged_count += 1
+        endpoints = [node for node in adjacency if len(adjacency.get(node, [])) == 1]
+    return bridged_count
+
+
+def order_closed_graph_component(adjacency, component, clusters):
+    if len(component) < 3:
+        return [], "too few vertices"
+
+    bad_degree_nodes = [node for node in component if len(adjacency.get(node, [])) != 2]
+    if bad_degree_nodes:
+        open_count = sum(1 for node in component if len(adjacency.get(node, [])) == 1)
+        branch_count = sum(1 for node in component if len(adjacency.get(node, [])) > 2)
+        return [], f"{open_count} open end(s), {branch_count} branch point(s)"
+
+    start = min(
+        component,
+        key=lambda node: (
+            clusters[node]["coord"][0],
+            clusters[node]["coord"][1],
+            clusters[node]["coord"][2],
+        ),
+    )
+    ordered = [start]
+    previous = None
+    current = start
+
+    for _ in range(len(component) + 2):
+        neighbors = sorted(adjacency[current])
+        next_node = None
+        for candidate in neighbors:
+            if candidate != previous:
+                next_node = candidate
+                break
+        if next_node is None:
+            break
+        if next_node == start:
+            if len(ordered) == len(component):
+                coords = [clusters[node]["coord"] for node in ordered]
+                return coords, None
+            break
+        if next_node in ordered:
+            break
+        ordered.append(next_node)
+        previous, current = current, next_node
+
+    return [], "could not walk a single closed boundary"
+
+
+def resolve_selected_edge_rings(obj, edge_indices, gap_tolerance):
+    mesh = obj.data
+    clusters = []
+    edge_pairs = set()
+    tolerance_sq = max(0.0, float(gap_tolerance)) ** 2
+
+    for edge_index in edge_indices:
+        if edge_index < 0 or edge_index >= len(mesh.edges):
+            continue
+        edge = mesh.edges[edge_index]
+        node_indices = []
+        for vertex_index in edge.vertices:
+            coord = mesh.vertices[vertex_index].co
+            node_indices.append(get_or_create_snap_cluster(
+                clusters,
+                (coord.x, coord.y, coord.z),
+                tolerance_sq,
+            ))
+        if node_indices[0] == node_indices[1]:
+            continue
+        edge_pairs.add(tuple(sorted(node_indices)))
+
+    adjacency = {index: set() for index in range(len(clusters))}
+    for node_a, node_b in edge_pairs:
+        adjacency[node_a].add(node_b)
+        adjacency[node_b].add(node_a)
+
+    rings = []
+    messages = []
+    bridged_total = bridge_endpoint_gaps(adjacency, clusters, tolerance_sq)
+    for component in get_graph_components(adjacency):
+        if len(component) < 3:
+            continue
+        coords, error = order_closed_graph_component(adjacency, component, clusters)
+        if coords:
+            rings.append(coords)
+        elif error:
+            messages.append(error)
+
+    return rings, bridged_total, messages
 
 
 def rebuild_tube_from_top_loop(obj, top_edge_indices, target_bottom_z, top_up_distance, bottom_down_distance=0.0):
@@ -5106,22 +5285,24 @@ class MINIATUREVOXELER_OT_prepare_platform_wall_loop_selection(Operator):
 
         if len(selected_edges) == 1:
             select_connected_edge_loops_from_seeds(obj)
+            bm = bmesh.from_edit_mesh(obj.data)
+            bm.edges.ensure_lookup_table()
+            selected_edges = [edge for edge in bm.edges if edge.select]
 
-        loop_groups = get_selected_edge_groups(obj)
-        if not loop_groups:
-            self.report({'ERROR'}, "Store Upper Ring needs at least one selected upper loop.")
+        selected_edge_indices = [edge.index for edge in selected_edges]
+        if not selected_edge_indices:
+            self.report({'ERROR'}, "Store Upper Ring needs at least one selected edge.")
             return {'CANCELLED'}
 
         bpy.ops.object.mode_set(mode='OBJECT')
-        rings = []
-        for loop_group in loop_groups:
-            top_edge_indices = [edge.index for edge in loop_group]
-            top_coords = get_ordered_loop_coords(obj, top_edge_indices)
-            if len(top_coords) >= 3:
-                rings.append(top_coords)
-
+        rings, bridged_count, messages = resolve_selected_edge_rings(
+            obj,
+            selected_edge_indices,
+            settings.platform_ring_gap_tolerance,
+        )
         if not rings:
-            self.report({'ERROR'}, "Could not read the selected upper ring(s).")
+            detail = messages[0] if messages else "selected edges do not form a closed boundary"
+            self.report({'ERROR'}, f"Could not resolve selected edge ring(s): {detail}. Increase Gap Tolerance or select missing edges.")
             return {'CANCELLED'}
 
         store_platform_rings_data(obj, rings)
@@ -5129,7 +5310,8 @@ class MINIATUREVOXELER_OT_prepare_platform_wall_loop_selection(Operator):
         enter_edit_vertex_wireframe(context, obj)
 
         vertex_count = sum(len(coords) for coords in rings)
-        self.report({'INFO'}, f"Stored {len(rings)} upper ring(s) ({vertex_count} vertices) and deleted all other wall geometry.")
+        gap_text = f", stitched {bridged_count} gap(s)" if bridged_count else ""
+        self.report({'INFO'}, f"Stored {len(rings)} upper ring(s) ({vertex_count} vertices{gap_text}) and deleted all other wall geometry.")
         return {'FINISHED'}
 
 
@@ -5505,6 +5687,7 @@ class MINIATUREVOXELER_PT_panel(Panel):
 
             # Step 1.5 stores the upper platform loop as the reusable cutter path.
             box = self.draw_step_box(layout, 'PLATFORM', "1.5 Store Ring")
+            box.prop(settings, "platform_ring_gap_tolerance")
             box.operator("object.mv_platform_wall_loop", text="Store Upper Loop And Reduce To Ring", icon='EDGESEL')
             if walls_obj is None:
                 box.label(text="Separate the platform cutter first.")
