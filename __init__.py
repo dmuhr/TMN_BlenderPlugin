@@ -12,6 +12,8 @@ import bpy
 import bmesh
 import gpu
 import json
+import os
+import shutil
 from collections import deque
 from gpu_extras.batch import batch_for_shader
 from math import atan2, cos, floor, hypot, pi, radians, sin
@@ -97,6 +99,11 @@ WORKFLOW_ROLE_STYLES = {
         "label": "Platform",
         "icon": 'MESH_GRID',
         "divider": "---- PLATFORM ----",
+    },
+    'EXPORT': {
+        "label": "Export",
+        "icon": 'EXPORT',
+        "divider": "---- EXPORT ----",
     },
 }
 
@@ -1910,6 +1917,19 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
         default=True,
     )
 
+    show_export_steps: BoolProperty(
+        name="---- EXPORT ----",
+        description="Show or hide the export workflow steps",
+        default=True,
+    )
+
+    export_directory: StringProperty(
+        name="Export Folder",
+        description="Folder for batch STL export and the optional Blender file copy",
+        default="//MiniatureVoxeler_Export",
+        subtype='DIR_PATH',
+    )
+
     octree_depth: IntProperty(
         name="Octree Depth",
         default=7,
@@ -2144,30 +2164,24 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
     )
 
     outer_skin_mm: FloatProperty(
-        name="Outer Skin (mm)",
-        description="Outward skin thickness in millimeters",
-        default=0.3,
+        name="Solidify Thickness (mm)",
+        description="Solidify thickness for separated skin pieces",
+        default=0.4,
         min=0.02,
         soft_max=100.0,
         precision=3,
     )
 
-    inset_amount: FloatProperty(
-        name="Inset",
-        default=0.0006,
-        min=0.0,
-        soft_max=1.0,
-        precision=4,
-    )
-
-    inside_skin_mm: FloatProperty(
-        name="Inner Skin (mm)",
-        description="Inward movement in millimeters. Cannot be positive",
-        default=-0.2,
-        max=0.0,
-        soft_min=-100.0,
+    skin_solidify_offset: FloatProperty(
+        name="Solidify Offset",
+        description="Solidify offset for separated skin pieces",
+        default=0.0,
+        min=-1.0,
+        max=1.0,
         precision=3,
     )
+
+    skin_solidify_even_thickness: BoolProperty(name="Even Thickness", default=True)
 
     color_skin_base_slot: EnumProperty(
         name="Base Slot",
@@ -2186,12 +2200,6 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
     color_skin_slot_2: BoolProperty(name="Slot 2", default=True)
     color_skin_slot_3: BoolProperty(name="Slot 3", default=True)
     color_skin_slot_4: BoolProperty(name="Slot 4", default=True)
-
-    make_boolean_base: BoolProperty(
-        name="Boolean-Difference base.",
-        description="Apply Boolean Difference on the base object using the generated skin objects",
-        default=False,
-    )
 
     platform_merge_distance: FloatProperty(
         name="Merge Distance",
@@ -2647,6 +2655,83 @@ def get_color_skin_objects(settings):
     ]
 
 
+def get_sorted_color_skin_objects(settings):
+    def slot_index_for_obj(obj):
+        marker = "_Lego_Skin_Slot_"
+        if marker not in obj.name:
+            return 999
+        value = obj.name.split(marker, 1)[1].split("_", 1)[0].split(".", 1)[0]
+        try:
+            return max(0, int(value) - 1)
+        except ValueError:
+            return 999
+
+    return sorted(get_color_skin_objects(settings), key=lambda obj: (slot_index_for_obj(obj), obj.name))
+
+
+def get_export_piece_objects(settings):
+    candidates = [
+        get_platform_foot_object(settings),
+        get_color_base_object(settings),
+        *get_sorted_color_skin_objects(settings),
+    ]
+    pieces = []
+    seen = set()
+    for obj in candidates:
+        if obj is None or obj.type != 'MESH' or obj.name in seen:
+            continue
+        pieces.append(obj)
+        seen.add(obj.name)
+    return pieces
+
+
+def sanitize_export_filename(name):
+    sanitized = "".join(
+        char if char.isalnum() or char in ("-", "_", ".") else "_"
+        for char in name.strip()
+    )
+    sanitized = sanitized.strip("._")
+    return sanitized or "MiniatureVoxeler_Piece"
+
+
+def resolve_export_directory(settings):
+    raw_path = settings.export_directory.strip() or "//MiniatureVoxeler_Export"
+    export_dir = bpy.path.abspath(raw_path)
+    if not os.path.isabs(export_dir):
+        export_dir = os.path.abspath(export_dir)
+    os.makedirs(export_dir, exist_ok=True)
+    return export_dir
+
+
+def export_object_to_stl(context, obj, filepath, scale=1000.0):
+    if context.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+    bpy.ops.object.select_all(action='DESELECT')
+    obj.select_set(True)
+    context.view_layer.objects.active = obj
+
+    try:
+        bpy.ops.wm.stl_export(
+            filepath=filepath,
+            export_selected_objects=True,
+            global_scale=scale,
+            apply_modifiers=True,
+        )
+    except Exception as stl_export_error:
+        try:
+            bpy.ops.export_mesh.stl(
+                filepath=filepath,
+                use_selection=True,
+                global_scale=scale,
+                use_mesh_modifiers=True,
+            )
+        except Exception as legacy_error:
+            raise RuntimeError(
+                f"Could not export {obj.name} as STL: {stl_export_error}; fallback failed: {legacy_error}"
+            ) from legacy_error
+
+
 def ensure_boolean_modifier(target_obj, cutter_obj, modifier_name, operation='DIFFERENCE', solver='EXACT'):
     mod = target_obj.modifiers.get(modifier_name)
     if mod is None or mod.type != 'BOOLEAN':
@@ -2658,6 +2743,10 @@ def ensure_boolean_modifier(target_obj, cutter_obj, modifier_name, operation='DI
     mod.object = cutter_obj
     if hasattr(mod, "solver"):
         mod.solver = solver
+    if hasattr(mod, "use_self"):
+        mod.use_self = True
+    if hasattr(mod, "use_hole_tolerant"):
+        mod.use_hole_tolerant = False
     return mod
 
 
@@ -2674,7 +2763,18 @@ def apply_boolean_modifiers_with_prefix(context, targets, prefix):
     return applied_count
 
 
-def ensure_solidify_modifier(obj, modifier_name, thickness, offset):
+def apply_modifier_if_present(context, obj, modifier_name):
+    if obj is None or obj.name not in bpy.data.objects:
+        return False
+    mod = obj.modifiers.get(modifier_name)
+    if mod is None:
+        return False
+    set_active_object(context, obj)
+    bpy.ops.object.modifier_apply(modifier=modifier_name)
+    return True
+
+
+def ensure_solidify_modifier(obj, modifier_name, thickness, offset, use_even_thickness=True):
     mod = obj.modifiers.get(modifier_name)
     if mod is None or mod.type != 'SOLIDIFY':
         if mod is not None:
@@ -2683,6 +2783,8 @@ def ensure_solidify_modifier(obj, modifier_name, thickness, offset):
 
     mod.thickness = thickness
     mod.offset = offset
+    if hasattr(mod, "use_even_offset"):
+        mod.use_even_offset = bool(use_even_thickness)
     if hasattr(mod, "solidify_mode"):
         mod.solidify_mode = 'NON_MANIFOLD'
     if hasattr(mod, "nonmanifold_thickness_mode"):
@@ -4331,7 +4433,7 @@ def get_boundary_edge_loops_from_mesh(mesh):
 
 
 def close_2d_cutter_inner_loop(context, obj):
-    return close_2d_cutter_inner_loops(context, obj)
+    return close_2d_cutter_selected_loops(context, obj)
 
 
 def tag_platform_fill_faces(obj, fill_face_indices, preserve_existing=True):
@@ -4465,66 +4567,56 @@ def select_sculpt_brush_tool(context, brush_type):
     return False
 
 
-def close_2d_cutter_inner_loops(context, obj):
+def close_2d_cutter_selected_loops(context, obj):
     mesh = obj.data
     loops = get_boundary_edge_loops_from_mesh(mesh)
-    if len(loops) < 2:
+    if not loops:
         return 0, 0
-
-    def loop_coords(loop):
-        return [mesh.vertices[index].co for index in loop]
-
-    def loop_area(loop):
-        coords = loop_coords(loop)
-        return abs(polygon_area_from_coords_xy([(coord.x, coord.y, coord.z) for coord in coords]))
-
-    def loop_center_xy(loop):
-        coords = loop_coords(loop)
-        return (
-            sum(coord.x for coord in coords) / len(coords),
-            sum(coord.y for coord in coords) / len(coords),
-        )
-
-    loop_infos = []
-    for loop in loops:
-        coords = [mesh.vertices[index].co for index in loop]
-        loop_infos.append({
-            "loop": loop,
-            "area": abs(polygon_area_from_coords_xy([(coord.x, coord.y, coord.z) for coord in coords])),
-            "polygon": [(coord.x, coord.y, coord.z) for coord in coords],
-            "center": loop_center_xy(loop),
-        })
-
-    inner_loops = []
-    for info in loop_infos:
-        for other in loop_infos:
-            if info is other or other["area"] <= info["area"]:
-                continue
-            if point_in_polygon_xy(info["center"], other["polygon"]):
-                inner_loops.append(info["loop"])
-                break
-
-    if not inner_loops:
-        inner_loops = [min(loops, key=loop_area)]
 
     face_count_before = len(mesh.polygons)
     editable_values_before_fill = get_face_int_attribute_values(mesh, "mv_platform_fill_face", 0)
 
-    # This is the scripted equivalent of selecting inner loops and pressing
-    # Alt+F with Beauty enabled in Blender's Fill operator.
     set_active_object(context, obj)
-    bpy.ops.object.mode_set(mode='EDIT')
+    if context.mode != 'EDIT_MESH':
+        bpy.ops.object.mode_set(mode='EDIT')
     bpy.ops.mesh.select_mode(type='EDGE')
-    bpy.ops.mesh.select_all(action='DESELECT')
 
     bm = bmesh.from_edit_mesh(mesh)
     bm.verts.ensure_lookup_table()
     bm.edges.ensure_lookup_table()
-    loop_set = set(index for loop in inner_loops for index in loop)
+    selected_edge_keys = {
+        tuple(sorted((edge.verts[0].index, edge.verts[1].index)))
+        for edge in bm.edges
+        if edge.select
+    }
+    if not selected_edge_keys:
+        bpy.ops.object.mode_set(mode='OBJECT')
+        return 0, 0
+
+    selected_loops = []
+    for loop in loops:
+        loop_edge_keys = {
+            tuple(sorted((loop[index], loop[(index + 1) % len(loop)])))
+            for index in range(len(loop))
+        }
+        if loop_edge_keys and loop_edge_keys.issubset(selected_edge_keys):
+            selected_loops.append(loop)
+
+    if not selected_loops:
+        selected_vertex_indices = {vert.index for vert in bm.verts if vert.select}
+        for loop in loops:
+            if all(index in selected_vertex_indices for index in loop):
+                selected_loops.append(loop)
+
+    if not selected_loops:
+        bpy.ops.object.mode_set(mode='OBJECT')
+        return 0, 0
+
+    selected_loop_set = set(index for loop in selected_loops for index in loop)
     for vert in bm.verts:
-        vert.select = vert.index in loop_set
+        vert.select = vert.index in selected_loop_set
     for edge in bm.edges:
-        edge.select = edge.verts[0].index in loop_set and edge.verts[1].index in loop_set
+        edge.select = edge.verts[0].index in selected_loop_set and edge.verts[1].index in selected_loop_set
     bm.select_flush_mode()
     bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
 
@@ -4545,7 +4637,7 @@ def close_2d_cutter_inner_loops(context, obj):
     mesh.update()
     select_platform_fill_faces(context, obj)
 
-    closed_vertex_count = sum(len(loop) for loop in inner_loops)
+    closed_vertex_count = sum(len(loop) for loop in selected_loops)
     return closed_vertex_count, max(0, len(mesh.polygons) - face_count_before)
 
 
@@ -4911,11 +5003,11 @@ def process_skin_object(context, obj, settings, axis_vec):
     )
 
     # 5) Move inward
-    inside_skin_distance = mm_to_scene_units(context, settings.inside_skin_mm)
+    inside_skin_distance = abs(mm_to_scene_units(context, settings.inside_skin_mm))
     move_vec = (
-        inside_skin_distance * axis_vec.x,
-        inside_skin_distance * axis_vec.y,
-        inside_skin_distance * axis_vec.z,
+        -inside_skin_distance * axis_vec.x,
+        -inside_skin_distance * axis_vec.y,
+        -inside_skin_distance * axis_vec.z,
     )
 
     bpy.ops.transform.translate(
@@ -4981,13 +5073,75 @@ def process_color_skin_object(context, obj, settings):
         use_outset=False,
     )
 
-    inside_skin_distance = mm_to_scene_units(context, settings.inside_skin_mm)
+    inside_skin_distance = -abs(mm_to_scene_units(context, settings.inside_skin_mm))
     bpy.ops.transform.shrink_fatten(
         value=inside_skin_distance,
         use_even_offset=True,
     )
 
     bpy.ops.object.mode_set(mode='OBJECT')
+
+
+def build_inward_boolean_cutter_mesh(context, source_obj, target_obj, settings, epsilon=None):
+    source_bm = bmesh.new()
+    source_bm.from_mesh(source_obj.data)
+    source_bm.verts.ensure_lookup_table()
+    source_bm.faces.ensure_lookup_table()
+    source_bm.normal_update()
+
+    if not source_bm.faces:
+        source_bm.free()
+        return 0
+
+    depth = abs(mm_to_scene_units(context, settings.inside_skin_mm))
+    if epsilon is None:
+        epsilon = max(depth * 0.05, meters_to_scene_units(context, 0.00002))
+
+    verts = []
+    faces = []
+    material_indices = []
+
+    for face in source_bm.faces:
+        if not face.is_valid or len(face.verts) < 3:
+            continue
+        normal = face.normal.normalized()
+        if normal.length <= 1e-12:
+            continue
+
+        outer_indices = []
+        inner_indices = []
+        for vert in face.verts:
+            outer_indices.append(len(verts))
+            verts.append(tuple(vert.co + (normal * epsilon)))
+        for vert in face.verts:
+            inner_indices.append(len(verts))
+            verts.append(tuple(vert.co - (normal * (depth + epsilon))))
+
+        faces.append(tuple(outer_indices))
+        material_indices.append(face.material_index)
+        faces.append(tuple(reversed(inner_indices)))
+        material_indices.append(face.material_index)
+
+        count = len(outer_indices)
+        for index in range(count):
+            next_index = (index + 1) % count
+            faces.append((
+                outer_indices[index],
+                outer_indices[next_index],
+                inner_indices[next_index],
+                inner_indices[index],
+            ))
+            material_indices.append(face.material_index)
+
+    target_obj.data.clear_geometry()
+    target_obj.data.from_pydata(verts, [], faces)
+    target_obj.data.update(calc_edges=True)
+    for polygon, material_index in zip(target_obj.data.polygons, material_indices):
+        polygon.material_index = material_index
+
+    source_bm.free()
+    cleanup_boolean_mesh(context, target_obj, triangulate=True)
+    return len(faces)
 
 
 def apply_boolean_difference(context, target_obj, cutter_obj, index, solver='EXACT'):
@@ -6829,9 +6983,9 @@ class MINIATUREVOXELER_OT_toggle_debug_colors(Operator):
 # Operator 8: Generate Lego Skin
 # ------------------------------------------------------------
 
-class MINIATUREVOXELER_OT_generate_color_skin(Operator):
-    bl_idname = "object.miniature_voxeler_generate_color_skin"
-    bl_label = "Generate Lego Skin"
+class MINIATUREVOXELER_OT_separate_skins_solidify(Operator):
+    bl_idname = "object.miniature_voxeler_separate_skins_solidify"
+    bl_label = "Separate Skins and Solidify"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -6866,8 +7020,13 @@ class MINIATUREVOXELER_OT_generate_color_skin(Operator):
         root_name = get_root_name(body_obj.name)
         source_name = get_inferred_source_name(settings, body_obj)
 
-        original_obj = body_obj
-        base_obj = duplicate_object(context, original_obj, get_color_base_name(root_name))
+        base_obj = get_color_base_object(settings)
+        if base_obj is not None:
+            remove_object_if_exists(base_obj)
+        for skin_obj in get_color_skin_objects(settings):
+            remove_object_if_exists(skin_obj)
+
+        base_obj = duplicate_object(context, body_obj, get_color_base_name(root_name))
         set_metadata(base_obj, root_name, source_name)
         base_material = ensure_lego_color_material(
             base_obj,
@@ -6875,86 +7034,67 @@ class MINIATUREVOXELER_OT_generate_color_skin(Operator):
             get_slot_palette_color(settings, base_slot_index),
         )
         apply_single_material_to_object(base_obj, base_material)
+        ensure_solidify_modifier(
+            base_obj,
+            "SkinSolidify",
+            mm_to_scene_units(context, settings.outer_skin_mm),
+            settings.skin_solidify_offset + 0.03,
+            settings.skin_solidify_even_thickness,
+        )
+        apply_modifier_if_present(context, base_obj, "SkinSolidify")
 
-        slot_sources = {}
-        for slot_index in enabled_skin_slots:
-            slot_source = duplicate_object(
-                context,
-                original_obj,
-                f"{get_color_skin_name(root_name, slot_index)}_Source"
-            )
-            set_metadata(slot_source, root_name, source_name)
-            slot_sources[slot_index] = slot_source
+        skin_source = duplicate_object(context, body_obj, f"{root_name}_Lego_Skin_Source")
+        set_metadata(skin_source, root_name, source_name)
 
         processed = []
         skipped = []
-        skin_objects = []
 
         for slot_index in enabled_skin_slots:
-            slot_source = slot_sources.get(slot_index)
-            if slot_source is None or slot_source.name not in bpy.data.objects:
-                self.report({'ERROR'}, f"Source object for slot {slot_index + 1} became invalid.")
+            if skin_source is None or skin_source.name not in bpy.data.objects:
+                self.report({'ERROR'}, "Skin source object became invalid.")
                 return {'CANCELLED'}
 
-            set_active_object(context, slot_source)
+            set_active_object(context, skin_source)
             bpy.ops.object.mode_set(mode='EDIT')
             bpy.ops.mesh.select_mode(type='FACE')
             bpy.ops.mesh.select_all(action='DESELECT')
 
-            selected_count = select_faces_by_material_slot(slot_source, [slot_index])
+            selected_count = select_faces_by_material_slot(skin_source, [slot_index])
             if selected_count == 0:
                 bpy.ops.object.mode_set(mode='OBJECT')
                 skipped.append(f"Slot {slot_index + 1}")
-                remove_object_if_exists(slot_source)
                 continue
 
             pre_names = set(obj.name for obj in bpy.data.objects)
             bpy.ops.mesh.separate(type='SELECTED')
             bpy.ops.object.mode_set(mode='OBJECT')
 
-            new_obj = find_new_object(pre_names, slot_source, context)
+            new_obj = find_new_object(pre_names, skin_source, context)
             if new_obj is None:
                 self.report({'ERROR'}, f"Could not identify separated skin object for slot {slot_index + 1}.")
                 return {'CANCELLED'}
 
-            slot_skin_parts = []
-            new_obj.name = f"{get_color_skin_name(root_name, slot_index)}_Mask"
+            new_obj.name = get_color_skin_name(root_name, slot_index)
             set_metadata(new_obj, root_name, source_name)
-            joined_skin = generate_north_south_skin_from_mask(
-                context,
+            ensure_solidify_modifier(
                 new_obj,
-                settings,
-                root_name,
-                slot_index,
-                source_name,
+                "SkinSolidify",
+                mm_to_scene_units(context, settings.outer_skin_mm),
+                settings.skin_solidify_offset,
+                settings.skin_solidify_even_thickness,
             )
-            if joined_skin is not None:
-                slot_skin_parts.append(joined_skin)
-            remove_object_if_exists(new_obj)
-
-            final_slot_skin = join_objects(context, slot_skin_parts, get_color_skin_name(root_name, slot_index))
-            if final_slot_skin is not None:
-                set_metadata(final_slot_skin, root_name, source_name)
-                skin_objects.append(final_slot_skin)
-
-            remove_object_if_exists(slot_source)
+            apply_modifier_if_present(context, new_obj, "SkinSolidify")
 
             label = f"Slot {slot_index + 1} ({selected_count} faces)"
             processed.append(label)
 
         if not processed:
-            for slot_source in slot_sources.values():
-                remove_object_if_exists(slot_source)
+            remove_object_if_exists(skin_source)
             set_active_object(context, base_obj)
             self.report({'WARNING'}, "No faces found for the selected skin slots.")
             return {'CANCELLED'}
 
-        if settings.make_boolean_base and skin_objects:
-            for i, skin_obj in enumerate(skin_objects):
-                apply_boolean_difference(context, base_obj, skin_obj, i)
-
-        for slot_source in slot_sources.values():
-            remove_object_if_exists(slot_source)
+        remove_object_if_exists(skin_source)
 
         body_obj.hide_set(True)
         set_active_object(context, base_obj)
@@ -6962,11 +7102,171 @@ class MINIATUREVOXELER_OT_generate_color_skin(Operator):
         msg = "Processed: " + ", ".join(processed)
         if skipped:
             msg += " | Skipped: " + ", ".join(skipped)
-        if settings.make_boolean_base:
-            msg += " | Boolean-Difference base. applied"
-        msg += " | Clean slot sources deleted | _Blocks hidden"
+        msg += " | Solidify applied | _Blocks hidden"
 
         self.report({'INFO'}, msg)
+        return {'FINISHED'}
+
+
+class MINIATUREVOXELER_OT_add_skin_booleans(Operator):
+    bl_idname = "object.miniature_voxeler_add_skin_booleans"
+    bl_label = "Add Booleans"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        settings = getattr(context.scene, "miniature_voxeler_settings", None)
+        return settings is not None and get_color_base_object(settings) is not None and bool(get_color_skin_objects(settings))
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        base_obj = get_color_base_object(settings)
+        skin_objects = get_sorted_color_skin_objects(settings)
+        if base_obj is None or not skin_objects:
+            self.report({'ERROR'}, "Run Separate Skins and Solidify first.")
+            return {'CANCELLED'}
+        foot_obj = get_platform_foot_object(settings)
+
+        added_count = 0
+        for skin_obj in skin_objects:
+            ensure_boolean_modifier(
+                base_obj,
+                skin_obj,
+                f"SkinBoolean_Base_{skin_obj.name}",
+                operation='DIFFERENCE',
+                solver='EXACT',
+            )
+            added_count += 1
+
+        for winner_index, winner_obj in enumerate(skin_objects):
+            for target_obj in skin_objects[winner_index + 1:]:
+                ensure_boolean_modifier(
+                    target_obj,
+                    winner_obj,
+                    f"SkinBoolean_Slot_{winner_obj.name}",
+                    operation='DIFFERENCE',
+                    solver='EXACT',
+                )
+                added_count += 1
+
+        if foot_obj is not None:
+            for target_obj in [base_obj] + skin_objects:
+                ensure_boolean_modifier(
+                    target_obj,
+                    foot_obj,
+                    f"SkinBoolean_Foot_{foot_obj.name}",
+                    operation='DIFFERENCE',
+                    solver='EXACT',
+                )
+                added_count += 1
+
+        set_active_object(context, base_obj)
+        foot_text = " Foot cuts _Base and all skins." if foot_obj is not None else " No _foot found; foot booleans skipped."
+        self.report({'INFO'}, f"Added {added_count} Exact boolean modifier(s). Lower slot numbers trim higher slots.{foot_text}")
+        return {'FINISHED'}
+
+
+class MINIATUREVOXELER_OT_apply_skin_booleans(Operator):
+    bl_idname = "object.miniature_voxeler_apply_skin_booleans"
+    bl_label = "Apply Booleans"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        settings = getattr(context.scene, "miniature_voxeler_settings", None)
+        return settings is not None and (
+            get_color_base_object(settings) is not None or bool(get_color_skin_objects(settings))
+        )
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        # Apply skins first so _Base is cut by final skin geometry.
+        targets = get_sorted_color_skin_objects(settings) + [get_color_base_object(settings)]
+        applied_count = apply_boolean_modifiers_with_prefix(context, targets, "SkinBoolean_")
+        if applied_count == 0:
+            self.report({'WARNING'}, "No SkinBoolean modifiers found to apply.")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Applied {applied_count} skin boolean modifier(s).")
+        return {'FINISHED'}
+
+
+class MINIATUREVOXELER_OT_export_final_pieces(Operator):
+    bl_idname = "object.miniature_voxeler_export_final_pieces"
+    bl_label = "Export Final Pieces"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        settings = getattr(context.scene, "miniature_voxeler_settings", None)
+        return settings is not None and bool(get_export_piece_objects(settings))
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        pieces = get_export_piece_objects(settings)
+        if not pieces:
+            self.report({'ERROR'}, "No _foot, _Base, or skin objects found to export.")
+            return {'CANCELLED'}
+
+        selected_before = [obj for obj in context.selected_objects]
+        active_before = context.view_layer.objects.active
+        visibility_before = [(obj, obj.hide_get(), obj.hide_viewport) for obj in pieces]
+
+        try:
+            export_dir = resolve_export_directory(settings)
+            exported_paths = []
+            used_names = set()
+
+            for obj in pieces:
+                obj.hide_set(False)
+                obj.hide_viewport = False
+                base_name = sanitize_export_filename(obj.name)
+                filename = f"{base_name}.stl"
+                counter = 2
+                while filename.lower() in used_names:
+                    filename = f"{base_name}_{counter}.stl"
+                    counter += 1
+                used_names.add(filename.lower())
+
+                filepath = os.path.join(export_dir, filename)
+                export_object_to_stl(context, obj, filepath, scale=1000.0)
+                exported_paths.append(filepath)
+
+            blend_copy_text = "Blend copy skipped."
+            blend_path = bpy.data.filepath
+            blend_filename = os.path.basename(blend_path) if blend_path else "MiniatureVoxeler_Export.blend"
+            target_blend = os.path.join(export_dir, blend_filename)
+            try:
+                if os.path.abspath(blend_path) != os.path.abspath(target_blend):
+                    bpy.ops.wm.save_as_mainfile(filepath=target_blend, copy=True)
+                    blend_copy_text = "Blend copy added."
+                else:
+                    blend_copy_text = "Blend file already in export folder."
+            except Exception as save_copy_error:
+                if blend_path and os.path.isfile(blend_path) and os.path.abspath(blend_path) != os.path.abspath(target_blend):
+                    shutil.copy2(blend_path, target_blend)
+                    blend_copy_text = "Blend disk copy added."
+                else:
+                    blend_copy_text = f"Blend copy skipped: {save_copy_error}"
+
+        except Exception as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+        finally:
+            if context.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+            bpy.ops.object.select_all(action='DESELECT')
+            for obj, hide_select_state, hide_viewport_state in visibility_before:
+                if obj.name in bpy.data.objects:
+                    obj.hide_set(hide_select_state)
+                    obj.hide_viewport = hide_viewport_state
+            for obj in selected_before:
+                if obj.name in bpy.data.objects:
+                    obj.select_set(True)
+            if active_before is not None and active_before.name in bpy.data.objects:
+                context.view_layer.objects.active = active_before
+
+        self.report({'INFO'}, f"Exported {len(exported_paths)} STL file(s) at scale 1000. {blend_copy_text}")
         return {'FINISHED'}
 
 
@@ -7647,7 +7947,7 @@ class MINIATUREVOXELER_OT_extrude_platform_walls_up(Operator):
 
 class MINIATUREVOXELER_OT_build_platform_building_cutter_2d(Operator):
     bl_idname = "object.mv_platform_cutter_close_2d"
-    bl_label = "Close 2D Cutter"
+    bl_label = "Beauty Fill Selected Loops"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -7662,16 +7962,42 @@ class MINIATUREVOXELER_OT_build_platform_building_cutter_2d(Operator):
             return {'CANCELLED'}
 
         if context.mode != 'OBJECT':
-            bpy.ops.object.mode_set(mode='OBJECT')
+            set_active_object(context, cutter_obj)
 
         closed_count, triangle_count = close_2d_cutter_inner_loop(context, cutter_obj)
         if closed_count == 0:
-            self.report({'ERROR'}, "Could not find the inner boundary loop to close.")
+            self.report({'ERROR'}, "Select one or more full inner boundary loops first.")
             return {'CANCELLED'}
 
         cutter_obj["mv_platform_stage"] = "building_cutter_2d_closed"
 
-        self.report({'INFO'}, f"Closed the 2D cutter with Beauty Fill: {triangle_count} triangle(s) from {closed_count} inner-loop vertices.")
+        self.report({'INFO'}, f"Beauty Fill completed: {triangle_count} triangle(s) from {closed_count} selected loop vertices.")
+        return {'FINISHED'}
+
+
+class MINIATUREVOXELER_OT_select_platform_fill_loops(Operator):
+    bl_idname = "object.mv_platform_fill_loops_select"
+    bl_label = "Select Inner Loops"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        settings = getattr(context.scene, "miniature_voxeler_settings", None)
+        return settings is not None and get_platform_walls_object(settings) is not None
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        cutter_obj = get_platform_walls_object(settings)
+        if cutter_obj is None:
+            self.report({'ERROR'}, "Build the 2D cutter from the rings object first.")
+            return {'CANCELLED'}
+
+        set_active_object(context, cutter_obj)
+        if context.mode != 'EDIT_MESH':
+            bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_mode(type='EDGE')
+        bpy.ops.mesh.select_all(action='DESELECT')
+        self.report({'INFO'}, "Select every inner boundary loop to fill, then run Beauty Fill Selected Loops.")
         return {'FINISHED'}
 
 
@@ -7694,7 +8020,7 @@ class MINIATUREVOXELER_OT_subdivide_platform_fill(Operator):
 
         selected_count = select_platform_fill_faces(context, cutter_obj)
         if selected_count == 0:
-            self.report({'ERROR'}, "No Beauty Fill faces are tagged. Run Beauty Fill Inner Loop first.")
+            self.report({'ERROR'}, "No Beauty Fill faces are tagged. Run Beauty Fill Selected Loops first.")
             return {'CANCELLED'}
 
         bpy.ops.mesh.subdivide(number_cuts=settings.platform_fill_subdivide_cuts, smoothness=0.0)
@@ -8119,9 +8445,10 @@ class MINIATUREVOXELER_PT_panel(Panel):
 
             # Step 1.8 closes the 2D cutter so it can become solid geometry.
             box = self.draw_step_box(layout, 'PLATFORM', "1.8 Close 2D Cutter")
-            box.label(text="Fills the inner loop with Beauty Fill.")
-            box.label(text="Inspect and manually fix holes or strange areas before the next step.")
-            box.operator("object.mv_platform_cutter_close_2d", text="Beauty Fill Inner Loop", icon='FACESEL')
+            box.label(text="Select each inner boundary loop, then fill the selected loops.")
+            row = box.row(align=True)
+            row.operator("object.mv_platform_fill_loops_select", text="Select Inner Loops", icon='EDGESEL')
+            row.operator("object.mv_platform_cutter_close_2d", text="Beauty Fill Selected Loops", icon='FACESEL')
             box.prop(settings, "platform_fill_subdivide_cuts")
             box.operator("object.mv_platform_fill_subdivide", text="Subdivide Fill", icon='MOD_SUBSURF')
 
@@ -8272,13 +8599,12 @@ class MINIATUREVOXELER_PT_panel(Panel):
             modify_op.slot_index = settings.selected_lego_palette_slot
 
             # Step 2.7 exports the colored building shell pieces for downstream use.
-            box = self.draw_step_box(layout, 'BUILDING', "2.7 Export Pieces")
+            box = self.draw_step_box(layout, 'BUILDING', "2.7 Prepare Skin")
             col = box.column(align=True)
             col.prop(settings, "color_skin_base_slot")
             col.prop(settings, "outer_skin_mm")
-            col.prop(settings, "inset_amount")
-            col.prop(settings, "inside_skin_mm")
-            col.prop(settings, "make_boolean_base")
+            col.prop(settings, "skin_solidify_offset")
+            col.prop(settings, "skin_solidify_even_thickness")
 
             box.label(text="Skin Slots")
             row = box.row(align=True)
@@ -8289,7 +8615,26 @@ class MINIATUREVOXELER_PT_panel(Panel):
             row.prop(settings, "color_skin_slot_3")
             row.prop(settings, "color_skin_slot_4")
 
-            box.operator("object.miniature_voxeler_generate_color_skin", text="Generate Colored Shell Pieces", icon='MATERIAL')
+            box.operator("object.miniature_voxeler_separate_skins_solidify", text="Separate Skins and Solidify", icon='MATERIAL')
+            caution_row = box.row(align=True)
+            caution_row.alert = True
+            caution_row.operator("object.miniature_voxeler_add_skin_booleans", text="Add Booleans (Warning, Slow!)", icon='MOD_BOOLEAN')
+            apply_row = box.row(align=True)
+            apply_row.alert = True
+            apply_row.operator("object.miniature_voxeler_apply_skin_booleans", text="Apply Booleans (Warning, Slow!)", icon='CHECKMARK')
+
+        if self.draw_path_divider(layout, settings, 'EXPORT', "show_export_steps"):
+            box = self.draw_step_box(layout, 'EXPORT', "3. Export")
+            col = box.column(align=True)
+            col.prop(settings, "export_directory")
+            export_pieces = get_export_piece_objects(settings)
+            if export_pieces:
+                box.label(text=f"Batch STL scale: 1000 | Pieces: {len(export_pieces)}")
+                for obj in export_pieces:
+                    box.label(text=obj.name, icon='MESH_CUBE')
+            else:
+                box.label(text="Prepare _foot, _Base, and skins before exporting.")
+            box.operator("object.miniature_voxeler_export_final_pieces", text="Export Batch STL + Blend Copy", icon='EXPORT')
 
 # ------------------------------------------------------------
 # Register
@@ -8308,7 +8653,10 @@ classes = (
     MINIATUREVOXELER_OT_voxel_brush_tool,
     MINIATUREVOXELER_OT_set_palette_color,
     MINIATUREVOXELER_OT_toggle_debug_colors,
-    MINIATUREVOXELER_OT_generate_color_skin,
+    MINIATUREVOXELER_OT_separate_skins_solidify,
+    MINIATUREVOXELER_OT_add_skin_booleans,
+    MINIATUREVOXELER_OT_apply_skin_booleans,
+    MINIATUREVOXELER_OT_export_final_pieces,
     MINIATUREVOXELER_OT_prepare_platform_copy,
     MINIATUREVOXELER_OT_prepare_platform_walls_selection,
     MINIATUREVOXELER_OT_separate_platform_walls,
@@ -8326,6 +8674,7 @@ classes = (
     MINIATUREVOXELER_OT_select_platform_ring_loops,
     MINIATUREVOXELER_OT_extrude_platform_walls_up,
     MINIATUREVOXELER_OT_build_platform_building_cutter_2d,
+    MINIATUREVOXELER_OT_select_platform_fill_loops,
     MINIATUREVOXELER_OT_subdivide_platform_fill,
     MINIATUREVOXELER_OT_prepare_platform_sculpting,
     MINIATUREVOXELER_OT_select_platform_sculpt_brush,
