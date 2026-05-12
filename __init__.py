@@ -12,8 +12,9 @@ import bpy
 import bmesh
 import gpu
 import json
+from collections import deque
 from gpu_extras.batch import batch_for_shader
-from math import atan2, cos, hypot, pi, radians, sin
+from math import atan2, cos, floor, hypot, pi, radians, sin
 from time import perf_counter
 from bpy_extras import view3d_utils
 from mathutils import Vector
@@ -811,21 +812,260 @@ def cell_intersects_top_loop_keepout(cell_center, voxel_size, keepout, z_floor):
     return False
 
 
-def is_point_inside_evaluated_mesh(obj_eval, point_world, ray_distance):
-    inverse_world = obj_eval.matrix_world.inverted()
-    point_local = inverse_world @ point_world
-    direction = Vector((1.0, 0.0, 0.0))
+def count_unique_ray_hits(obj_eval, point_local, direction, ray_distance, merge_distance):
     origin = point_local.copy()
     hits = 0
+    last_location = None
 
-    for _ in range(256):
+    for _ in range(512):
         hit, location, normal, face_index = obj_eval.ray_cast(origin, direction, distance=ray_distance)
         if not hit or face_index < 0:
             break
-        hits += 1
-        origin = location + (direction * 1e-6)
+        if last_location is None or (location - last_location).length > merge_distance:
+            hits += 1
+            last_location = location.copy()
+        origin = location + (direction * merge_distance)
 
-    return (hits % 2) == 1
+    return hits
+
+
+def is_point_inside_evaluated_mesh(obj_eval, point_world, ray_distance, epsilon=1e-6):
+    inverse_world = obj_eval.matrix_world.inverted()
+    point_local = inverse_world @ point_world
+    directions = (
+        Vector((1.0, 0.0, 0.0)),
+        Vector((0.0, 1.0, 0.0)),
+        Vector((0.0, 0.0, 1.0)),
+        Vector((0.819, 0.337, 0.463)).normalized(),
+        Vector((-0.271, 0.914, 0.302)).normalized(),
+    )
+    merge_distance = max(float(epsilon), float(ray_distance) * 1e-7)
+    inside_votes = 0
+
+    for index, direction in enumerate(directions):
+        hits = count_unique_ray_hits(obj_eval, point_local, direction, ray_distance, merge_distance)
+        if hits % 2 == 1:
+            inside_votes += 1
+        checked_count = index + 1
+        remaining_count = len(directions) - checked_count
+        if inside_votes >= 3:
+            return True
+        if inside_votes + remaining_count < 3:
+            return False
+
+    return False
+
+
+def fill_enclosed_voxel_cavities(cells, counts, fill_slot=0):
+    if not cells:
+        return 0
+
+    max_i, max_j, max_k = counts
+    outside = set()
+    queue = deque()
+
+    def enqueue_if_empty(coord):
+        if coord in cells or coord in outside:
+            return
+        outside.add(coord)
+        queue.append(coord)
+
+    for i in range(max_i):
+        for j in range(max_j):
+            enqueue_if_empty((i, j, 0))
+            enqueue_if_empty((i, j, max_k - 1))
+    for i in range(max_i):
+        for k in range(max_k):
+            enqueue_if_empty((i, 0, k))
+            enqueue_if_empty((i, max_j - 1, k))
+    for j in range(max_j):
+        for k in range(max_k):
+            enqueue_if_empty((0, j, k))
+            enqueue_if_empty((max_i - 1, j, k))
+
+    neighbors = (
+        (1, 0, 0),
+        (-1, 0, 0),
+        (0, 1, 0),
+        (0, -1, 0),
+        (0, 0, 1),
+        (0, 0, -1),
+    )
+    while queue:
+        i, j, k = queue.popleft()
+        for di, dj, dk in neighbors:
+            coord = (i + di, j + dj, k + dk)
+            if (
+                coord[0] < 0 or coord[0] >= max_i or
+                coord[1] < 0 or coord[1] >= max_j or
+                coord[2] < 0 or coord[2] >= max_k
+            ):
+                continue
+            enqueue_if_empty(coord)
+
+    filled_count = 0
+    for i in range(max_i):
+        for j in range(max_j):
+            for k in range(max_k):
+                coord = (i, j, k)
+                if coord in cells or coord in outside:
+                    continue
+                cells[coord] = int(fill_slot)
+                filled_count += 1
+
+    return filled_count
+
+
+def fill_vertical_voxel_columns(cells, fill_slot=0):
+    if not cells:
+        return 0
+
+    z_bounds_by_column = {}
+    for i, j, k in cells.keys():
+        key = (i, j)
+        bounds = z_bounds_by_column.get(key)
+        if bounds is None:
+            z_bounds_by_column[key] = [k, k]
+        else:
+            bounds[0] = min(bounds[0], k)
+            bounds[1] = max(bounds[1], k)
+
+    filled_count = 0
+    for (i, j), (min_k, max_k) in z_bounds_by_column.items():
+        for k in range(min_k, max_k + 1):
+            coord = (i, j, k)
+            if coord in cells:
+                continue
+            cells[coord] = int(fill_slot)
+            filled_count += 1
+
+    return filled_count
+
+
+def clamp_voxel_index(value, limit):
+    return max(0, min(int(value), int(limit) - 1))
+
+
+def get_voxel_index(value, origin_value, voxel_size):
+    return int(floor((float(value) - float(origin_value)) / float(voxel_size)))
+
+
+def triangle_intersects_aabb(triangle, box_min, box_max):
+    tri_min = Vector((
+        min(vertex.x for vertex in triangle),
+        min(vertex.y for vertex in triangle),
+        min(vertex.z for vertex in triangle),
+    ))
+    tri_max = Vector((
+        max(vertex.x for vertex in triangle),
+        max(vertex.y for vertex in triangle),
+        max(vertex.z for vertex in triangle),
+    ))
+    if (
+        tri_max.x < box_min.x or tri_min.x > box_max.x or
+        tri_max.y < box_min.y or tri_min.y > box_max.y or
+        tri_max.z < box_min.z or tri_min.z > box_max.z
+    ):
+        return False
+
+    center = (box_min + box_max) * 0.5
+    half = (box_max - box_min) * 0.5
+    a, b, c = triangle
+    edge_ab = b - a
+    edge_bc = c - b
+    edge_ca = a - c
+    normal = edge_ab.cross(edge_bc)
+    if normal.length <= 1e-12:
+        return False
+
+    plane_radius = (
+        half.x * abs(normal.x) +
+        half.y * abs(normal.y) +
+        half.z * abs(normal.z)
+    )
+    plane_distance = normal.dot(center - a)
+    if abs(plane_distance) > plane_radius:
+        return False
+
+    box_axes = (
+        Vector((1.0, 0.0, 0.0)),
+        Vector((0.0, 1.0, 0.0)),
+        Vector((0.0, 0.0, 1.0)),
+    )
+    edges = (edge_ab, edge_bc, edge_ca)
+    for edge in edges:
+        for box_axis in box_axes:
+            axis = edge.cross(box_axis)
+            if axis.length <= 1e-12:
+                continue
+            tri_offsets = [axis.dot(vertex - center) for vertex in triangle]
+            tri_min_proj = min(tri_offsets)
+            tri_max_proj = max(tri_offsets)
+            box_radius = (
+                half.x * abs(axis.x) +
+                half.y * abs(axis.y) +
+                half.z * abs(axis.z)
+            )
+            if tri_min_proj > box_radius or tri_max_proj < -box_radius:
+                return False
+
+    return True
+
+
+def mark_triangle_surface_voxels(triangle, origin, voxel_size, counts, cells, slot_index=0):
+    tri_min = Vector((
+        min(vertex.x for vertex in triangle),
+        min(vertex.y for vertex in triangle),
+        min(vertex.z for vertex in triangle),
+    ))
+    tri_max = Vector((
+        max(vertex.x for vertex in triangle),
+        max(vertex.y for vertex in triangle),
+        max(vertex.z for vertex in triangle),
+    ))
+    min_i = clamp_voxel_index(get_voxel_index(tri_min.x, origin.x, voxel_size), counts[0])
+    min_j = clamp_voxel_index(get_voxel_index(tri_min.y, origin.y, voxel_size), counts[1])
+    min_k = clamp_voxel_index(get_voxel_index(tri_min.z, origin.z, voxel_size), counts[2])
+    max_i = clamp_voxel_index(get_voxel_index(tri_max.x, origin.x, voxel_size), counts[0])
+    max_j = clamp_voxel_index(get_voxel_index(tri_max.y, origin.y, voxel_size), counts[1])
+    max_k = clamp_voxel_index(get_voxel_index(tri_max.z, origin.z, voxel_size), counts[2])
+
+    for i in range(min_i, max_i + 1):
+        x = origin.x + (i * voxel_size)
+        for j in range(min_j, max_j + 1):
+            y = origin.y + (j * voxel_size)
+            for k in range(min_k, max_k + 1):
+                z = origin.z + (k * voxel_size)
+                box_min = Vector((x, y, z))
+                box_max = box_min + Vector((voxel_size, voxel_size, voxel_size))
+                if triangle_intersects_aabb(triangle, box_min, box_max):
+                    cells[(i, j, k)] = int(slot_index)
+
+
+def mark_surface_voxel_cells_from_object(obj_eval, origin, voxel_size, counts, cells):
+    mesh = obj_eval.to_mesh()
+    if mesh is None:
+        return 0
+
+    start_count = len(cells)
+    try:
+        world_vertices = [obj_eval.matrix_world @ vertex.co for vertex in mesh.vertices]
+        for poly in mesh.polygons:
+            indices = list(poly.vertices)
+            if len(indices) < 3:
+                continue
+            first = indices[0]
+            for index in range(1, len(indices) - 1):
+                triangle = (
+                    world_vertices[first],
+                    world_vertices[indices[index]],
+                    world_vertices[indices[index + 1]],
+                )
+                mark_triangle_surface_voxels(triangle, origin, voxel_size, counts, cells)
+    finally:
+        obj_eval.to_mesh_clear()
+
+    return len(cells) - start_count
 
 
 def get_voxel_cell_face_vectors():
@@ -1063,21 +1303,17 @@ def generate_voxel_cells_from_object(context, source_obj, settings):
         max(1, int((bbox_max.y - bbox_min.y) / voxel_size) + 3),
         max(1, int((bbox_max.z - bbox_min.z) / voxel_size) + 3),
     )
-    diagonal = (bbox_max - bbox_min).length + (voxel_size * 4.0)
     cells = {}
 
-    for i in range(counts[0]):
-        x = origin.x + ((i + 0.5) * voxel_size)
-        for j in range(counts[1]):
-            y = origin.y + ((j + 0.5) * voxel_size)
-            for k in range(counts[2]):
-                z = origin.z + ((k + 0.5) * voxel_size)
-                center = Vector((x, y, z))
-                if not is_point_inside_evaluated_mesh(source_eval, center, diagonal):
-                    continue
-                cells[(i, j, k)] = 0
-
-    return origin, voxel_size, cells
+    surface_cell_count = mark_surface_voxel_cells_from_object(source_eval, origin, voxel_size, counts, cells)
+    cavity_fill_count = fill_enclosed_voxel_cavities(cells, counts)
+    vertical_fill_count = fill_vertical_voxel_columns(cells)
+    stats = {
+        "surface_cell_count": surface_cell_count,
+        "cavity_fill_count": cavity_fill_count,
+        "vertical_fill_count": vertical_fill_count,
+    }
+    return origin, voxel_size, cells, stats
 
 
 def get_face_attribute_value(mesh, attribute_name, face_index, default_value=0):
@@ -1171,6 +1407,17 @@ def get_grid_brush_target_coords(center_coord, face_dir, brush_size):
             center_coord[2] + offset[2],
         )
         for offset in get_grid_brush_sphere_offsets(brush_size)
+    ]
+
+
+def get_grid_brush_plane_target_coords(center_coord, face_dir, brush_size):
+    return [
+        (
+            center_coord[0] + offset[0],
+            center_coord[1] + offset[1],
+            center_coord[2] + offset[2],
+        )
+        for offset in get_grid_brush_offsets_for_face(face_dir, brush_size)
     ]
 
 
@@ -1445,6 +1692,49 @@ def get_voxel_plane_edit_target(context, event, obj, cells, fallback_slot, grid_
         "target": target,
         "slot": None,
         "fallback_slot": fallback_slot,
+        "face_dir": face_dir,
+    }
+
+
+def get_voxel_remove_plane_edit_target(context, event, obj, grid_cache, face_dir, plane_coord):
+    region, region_3d, mouse_coord = get_mouse_region_coord(context, event)
+    if region is None or grid_cache is None:
+        return None
+
+    origin = grid_cache["origin"]
+    voxel_size = grid_cache["voxel_size"]
+    axis = get_axis_for_face_dir(face_dir)
+    ray_origin_world = view3d_utils.region_2d_to_origin_3d(region, region_3d, mouse_coord)
+    ray_direction_world = view3d_utils.region_2d_to_vector_3d(region, region_3d, mouse_coord)
+    ray_origin = grid_cache["inverse_matrix"] @ ray_origin_world
+    ray_direction = (grid_cache["inverse_rotation"] @ ray_direction_world).normalized()
+    if abs(ray_direction[axis]) < 1e-12:
+        return None
+
+    plane_value = origin[axis] + ((plane_coord + 0.5) * voxel_size)
+    t = (plane_value - ray_origin[axis]) / ray_direction[axis]
+    if t < 0.0:
+        return None
+
+    point = ray_origin + (ray_direction * t)
+    target = [
+        int((point.x - origin.x) // voxel_size),
+        int((point.y - origin.y) // voxel_size),
+        int((point.z - origin.z) // voxel_size),
+    ]
+    target[axis] = plane_coord
+    min_i, min_j, min_k, max_i, max_j, max_k = grid_cache["bounds"]
+    if (
+        target[0] < min_i or target[0] >= max_i or
+        target[1] < min_j or target[1] >= max_j or
+        target[2] < min_k or target[2] >= max_k
+    ):
+        return None
+
+    return {
+        "cell": tuple(target),
+        "target": tuple(target),
+        "slot": None,
         "face_dir": face_dir,
     }
 
@@ -5167,14 +5457,17 @@ class MINIATUREVOXELER_OT_block_remesh(Operator):
         new_obj = duplicate_object(context, source_obj, get_blocks_name(root_name))
         set_metadata(new_obj, root_name, source_obj.name)
 
-        origin, voxel_size, cells = generate_voxel_cells_from_object(context, source_obj, settings)
+        origin, voxel_size, cells, voxel_stats = generate_voxel_cells_from_object(context, source_obj, settings)
         rebuild_voxel_mesh_from_cells(new_obj, origin, voxel_size, cells)
+        new_obj["mv_surface_cell_count"] = int(voxel_stats.get("surface_cell_count", 0))
+        new_obj["mv_cavity_fill_cell_count"] = int(voxel_stats.get("cavity_fill_count", 0))
+        new_obj["mv_vertical_fill_cell_count"] = int(voxel_stats.get("vertical_fill_count", 0))
         source_obj.hide_set(True)
         if building_obj is not None:
             building_obj.hide_set(True)
         set_active_object(context, new_obj)
         voxel_size_mm = voxel_size * context.scene.unit_settings.scale_length * 1000.0
-        self.report({'INFO'}, f"Created voxel object: {new_obj.name} from {source_obj.name} | {len(cells)} cubes | {voxel_size_mm:.3f} mm")
+        self.report({'INFO'}, f"Created voxel object: {new_obj.name} from {source_obj.name} | {len(cells)} cubes | surface {voxel_stats.get('surface_cell_count', 0)} + cavity {voxel_stats.get('cavity_fill_count', 0)} + vertical {voxel_stats.get('vertical_fill_count', 0)} | {voxel_size_mm:.3f} mm")
         return {'FINISHED'}
 
 
@@ -5864,11 +6157,18 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
 
         hover = getattr(operator, "_hover_edit", None)
         if hover is not None:
-            target_coords = get_grid_brush_target_coords(
-                hover["target"],
-                hover.get("face_dir", 4),
-                settings.lego_paint_brush_size,
-            )
+            if operator.mode == 'REMOVE':
+                target_coords = get_grid_brush_plane_target_coords(
+                    hover["target"],
+                    hover.get("face_dir", 4),
+                    settings.lego_paint_brush_size,
+                )
+            else:
+                target_coords = get_grid_brush_target_coords(
+                    hover["target"],
+                    hover.get("face_dir", 4),
+                    settings.lego_paint_brush_size,
+                )
             face_coords = []
             wire_coords = []
             inflate = 0.025
@@ -6050,11 +6350,18 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
         hover = getattr(self, "_hover_edit", None)
         if hover is None:
             return 0
-        target_coords = get_grid_brush_target_coords(
-            hover["target"],
-            hover.get("face_dir", 4),
-            getattr(self, "_active_brush_size", 1),
-        )
+        if self.mode == 'REMOVE':
+            target_coords = get_grid_brush_plane_target_coords(
+                hover["target"],
+                hover.get("face_dir", 4),
+                getattr(self, "_active_brush_size", 1),
+            )
+        else:
+            target_coords = get_grid_brush_target_coords(
+                hover["target"],
+                hover.get("face_dir", 4),
+                getattr(self, "_active_brush_size", 1),
+            )
         signature = (self.mode, tuple(sorted(target_coords)))
         if getattr(self, "_last_applied_target", None) == signature:
             return 0
@@ -6231,6 +6538,22 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
                 self._drag_plane_coord,
             )
             self.record_timing("hover", perf_counter() - hover_start)
+        elif (
+            self.mode == 'REMOVE' and
+            self._is_editing and
+            self._drag_face_dir is not None and
+            mouse_coord is not None
+        ):
+            hover_start = perf_counter()
+            self._hover_edit = get_voxel_remove_plane_edit_target(
+                context,
+                event,
+                obj,
+                self._grid_cache,
+                self._drag_face_dir,
+                self._drag_plane_coord,
+            )
+            self.record_timing("hover", perf_counter() - hover_start)
         elif self.mode in {'ADD', 'REMOVE'} and mouse_coord is not None:
             hover_start = perf_counter()
             self._hover_edit = get_voxel_cursor_edit_target(
@@ -6334,9 +6657,9 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
                 elif self.mode == 'ADD' and self._hover_edit is not None:
                     self._drag_face_dir = self._hover_edit.get("face_dir")
                     self._drag_plane_coord = self._hover_edit["target"][get_axis_for_face_dir(self._drag_face_dir)]
-                elif self.mode == 'REMOVE':
-                    self._drag_face_dir = None
-                    self._drag_plane_coord = None
+                elif self.mode == 'REMOVE' and self._hover_edit is not None:
+                    self._drag_face_dir = self._hover_edit.get("face_dir")
+                    self._drag_plane_coord = self._hover_edit["target"][get_axis_for_face_dir(self._drag_face_dir)]
                 self._is_editing = True
                 self._last_applied_target = None
             elif event.value == 'RELEASE':
