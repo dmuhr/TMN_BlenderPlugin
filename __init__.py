@@ -75,6 +75,13 @@ FIXED_LEGO_PALETTE_ITEMS = [
     for index, (name, color) in enumerate(FIXED_LEGO_PALETTE)
 ]
 
+DEBUG_LEGO_COLORS = (
+    (1.0, 0.0, 0.0),
+    (0.0, 1.0, 0.0),
+    (0.0, 0.0, 1.0),
+    (1.0, 1.0, 1.0),
+)
+
 WORKFLOW_ROLE_STYLES = {
     'SOURCE': {
         "label": "Source",
@@ -158,6 +165,8 @@ def update_palette_slot_material(settings, context, slot_index):
 
     obj = get_blocks_object(settings)
     if obj is None:
+        return
+    if bool(obj.get("mv_debug_colors_active", False)):
         return
 
     if slot_index >= len(obj.data.materials):
@@ -2031,6 +2040,32 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
         max=3,
     )
 
+    debug_palette_slot_color_1: FloatVectorProperty(name="Debug Red", subtype='COLOR', size=3, min=0.0, max=1.0, default=DEBUG_LEGO_COLORS[0])
+    debug_palette_slot_color_2: FloatVectorProperty(name="Debug Green", subtype='COLOR', size=3, min=0.0, max=1.0, default=DEBUG_LEGO_COLORS[1])
+    debug_palette_slot_color_3: FloatVectorProperty(name="Debug Blue", subtype='COLOR', size=3, min=0.0, max=1.0, default=DEBUG_LEGO_COLORS[2])
+    debug_palette_slot_color_4: FloatVectorProperty(name="Debug White", subtype='COLOR', size=3, min=0.0, max=1.0, default=DEBUG_LEGO_COLORS[3])
+
+    fixed_palette_color_1: FloatVectorProperty(name="Deep Night", subtype='COLOR', size=3, min=0.0, max=1.0, default=FIXED_LEGO_PALETTE[0][1])
+    fixed_palette_color_2: FloatVectorProperty(name="Muted Periwinkle", subtype='COLOR', size=3, min=0.0, max=1.0, default=FIXED_LEGO_PALETTE[1][1])
+    fixed_palette_color_3: FloatVectorProperty(name="Pale Ice Blue", subtype='COLOR', size=3, min=0.0, max=1.0, default=FIXED_LEGO_PALETTE[2][1])
+    fixed_palette_color_4: FloatVectorProperty(name="White", subtype='COLOR', size=3, min=0.0, max=1.0, default=FIXED_LEGO_PALETTE[3][1])
+    fixed_palette_color_5: FloatVectorProperty(name="Electric Cyan", subtype='COLOR', size=3, min=0.0, max=1.0, default=FIXED_LEGO_PALETTE[4][1])
+    fixed_palette_color_6: FloatVectorProperty(name="Soft Cobalt", subtype='COLOR', size=3, min=0.0, max=1.0, default=FIXED_LEGO_PALETTE[5][1])
+    fixed_palette_color_7: FloatVectorProperty(name="Deep Violet", subtype='COLOR', size=3, min=0.0, max=1.0, default=FIXED_LEGO_PALETTE[6][1])
+    fixed_palette_color_8: FloatVectorProperty(name="Lavender Blue", subtype='COLOR', size=3, min=0.0, max=1.0, default=FIXED_LEGO_PALETTE[7][1])
+    fixed_palette_color_9: FloatVectorProperty(name="Light Cornflower", subtype='COLOR', size=3, min=0.0, max=1.0, default=FIXED_LEGO_PALETTE[8][1])
+    fixed_palette_color_10: FloatVectorProperty(name="Royal Purple", subtype='COLOR', size=3, min=0.0, max=1.0, default=FIXED_LEGO_PALETTE[9][1])
+    fixed_palette_color_11: FloatVectorProperty(name="Hot Magenta", subtype='COLOR', size=3, min=0.0, max=1.0, default=FIXED_LEGO_PALETTE[10][1])
+    fixed_palette_color_12: FloatVectorProperty(name="Peach", subtype='COLOR', size=3, min=0.0, max=1.0, default=FIXED_LEGO_PALETTE[11][1])
+    fixed_palette_color_13: FloatVectorProperty(name="Coral Red", subtype='COLOR', size=3, min=0.0, max=1.0, default=FIXED_LEGO_PALETTE[12][1])
+    fixed_palette_color_14: FloatVectorProperty(name="Wine Rose", subtype='COLOR', size=3, min=0.0, max=1.0, default=FIXED_LEGO_PALETTE[13][1])
+    fixed_palette_color_15: FloatVectorProperty(name="Warm Orange", subtype='COLOR', size=3, min=0.0, max=1.0, default=FIXED_LEGO_PALETTE[14][1])
+    fixed_palette_color_16: FloatVectorProperty(name="Soft Yellow", subtype='COLOR', size=3, min=0.0, max=1.0, default=FIXED_LEGO_PALETTE[15][1])
+    fixed_palette_color_17: FloatVectorProperty(name="Fresh Green", subtype='COLOR', size=3, min=0.0, max=1.0, default=FIXED_LEGO_PALETTE[16][1])
+    fixed_palette_color_18: FloatVectorProperty(name="Deep Teal", subtype='COLOR', size=3, min=0.0, max=1.0, default=FIXED_LEGO_PALETTE[17][1])
+    fixed_palette_color_19: FloatVectorProperty(name="Aqua Teal", subtype='COLOR', size=3, min=0.0, max=1.0, default=FIXED_LEGO_PALETTE[18][1])
+    fixed_palette_color_20: FloatVectorProperty(name="Mint Glow", subtype='COLOR', size=3, min=0.0, max=1.0, default=FIXED_LEGO_PALETTE[19][1])
+
     lego_palette_slot_1: EnumProperty(
         name="Slot 1",
         description="Fixed palette color for material slot 1",
@@ -2106,12 +2141,6 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
         min=1,
         soft_max=80,
         max=300,
-    )
-
-    voxel_brush_debug: BoolProperty(
-        name="Debug Brush Timing",
-        description="Print Voxel Brush timing samples to the console and status bar",
-        default=False,
     )
 
     outer_skin_mm: FloatProperty(
@@ -6132,7 +6161,7 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
         name="Mode",
         items=[
             ('PAINT', "Paint", "Paint visible voxel faces"),
-            ('ADD', "Add Cubes", "Add cubes on the voxel grid"),
+            ('ADD', "Modify Cubes", "Add cubes on the voxel grid; hold Shift while dragging to remove cubes"),
             ('REMOVE', "Remove Cubes", "Remove cubes from the voxel grid"),
         ],
         default='PAINT',
@@ -6157,7 +6186,8 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
 
         hover = getattr(operator, "_hover_edit", None)
         if hover is not None:
-            if operator.mode == 'REMOVE':
+            effective_mode = getattr(operator, "_effective_mode", operator.mode)
+            if effective_mode in {'ADD', 'REMOVE'}:
                 target_coords = get_grid_brush_plane_target_coords(
                     hover["target"],
                     hover.get("face_dir", 4),
@@ -6175,8 +6205,8 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
             for target_coord in target_coords:
                 face_coords.extend(get_voxel_cell_face_coords(obj, target_coord, inflate))
                 wire_coords.extend(get_voxel_cell_wire_coords(obj, target_coord, inflate))
-            fill_color = (0.15, 1.0, 0.35, 0.28) if operator.mode == 'ADD' else (1.0, 0.08, 0.04, 0.32)
-            wire_color = (0.2, 1.0, 0.35, 0.95) if operator.mode == 'ADD' else (1.0, 0.14, 0.08, 0.95)
+            fill_color = (0.15, 1.0, 0.35, 0.28) if effective_mode == 'ADD' else (1.0, 0.08, 0.04, 0.32)
+            wire_color = (0.2, 1.0, 0.35, 0.95) if effective_mode == 'ADD' else (1.0, 0.14, 0.08, 0.95)
             draw_voxel_transparent_cells(obj, face_coords, fill_color)
             draw_voxel_wire_cells(obj, wire_coords, wire_color)
 
@@ -6211,11 +6241,12 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
         if context.window is None:
             return
 
+        effective_mode = self.get_effective_mode(event)
         if getattr(self, "_is_picking_color", False):
             cursor = 'EYEDROPPER'
-        elif self.mode == 'PAINT':
+        elif effective_mode == 'PAINT':
             cursor = 'PAINT_BRUSH'
-        elif self.mode == 'ADD':
+        elif effective_mode == 'ADD':
             cursor = 'CROSSHAIR'
         else:
             cursor = 'KNIFE'
@@ -6254,6 +6285,11 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
         if context.window is not None and getattr(self, "_current_cursor", None) is not None:
             context.window.cursor_modal_restore()
             self._current_cursor = None
+
+    def get_effective_mode(self, event=None):
+        if self.mode == 'ADD' and event is not None and getattr(event, "shift", False):
+            return 'REMOVE'
+        return self.mode
 
     def record_timing(self, label, elapsed):
         if not getattr(self, "_debug_enabled", False):
@@ -6350,7 +6386,8 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
         hover = getattr(self, "_hover_edit", None)
         if hover is None:
             return 0
-        if self.mode == 'REMOVE':
+        effective_mode = getattr(self, "_effective_mode", self.mode)
+        if effective_mode in {'ADD', 'REMOVE'}:
             target_coords = get_grid_brush_plane_target_coords(
                 hover["target"],
                 hover.get("face_dir", 4),
@@ -6362,12 +6399,12 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
                 hover.get("face_dir", 4),
                 getattr(self, "_active_brush_size", 1),
             )
-        signature = (self.mode, tuple(sorted(target_coords)))
+        signature = (effective_mode, tuple(sorted(target_coords)))
         if getattr(self, "_last_applied_target", None) == signature:
             return 0
 
         changed_count = 0
-        if self.mode == 'ADD':
+        if effective_mode == 'ADD':
             direction = get_voxel_cell_face_vectors()[hover.get("face_dir", 4)]
             for target in target_coords:
                 if target in self._cells:
@@ -6392,7 +6429,7 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
                 self._pending_added.add(target)
                 self._pending_removed.discard(target)
                 changed_count += 1
-        elif self.mode == 'REMOVE':
+        elif effective_mode == 'REMOVE':
             for target in target_coords:
                 if target not in self._cells:
                     continue
@@ -6452,6 +6489,7 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
             if self.mode == 'PAINT':
                 settings.selected_lego_palette_slot = self.slot_index
                 previous._face_centers_world = get_voxel_face_centers_world(obj)
+            previous._effective_mode = previous.mode
             previous.update_modal_cursor(context, event)
             self.report({'INFO'}, f"Voxel Brush switched to {self.mode.lower().replace('_', ' ')}.")
             return {'FINISHED'}
@@ -6471,8 +6509,10 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
         self._last_applied_target = None
         self._drag_face_dir = None
         self._drag_plane_coord = None
+        self._drag_effective_mode = None
         self._hover_edit = None
-        self._debug_enabled = bool(settings.voxel_brush_debug)
+        self._effective_mode = self.mode
+        self._debug_enabled = False
         self._profile_samples = {}
         self._last_profile_report = perf_counter()
         self._mouse_region_coord = None
@@ -6492,7 +6532,7 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
         self.add_draw_handler(context)
         context.window_manager.modal_handler_add(self)
         self.update_modal_cursor(context, event)
-        self.report({'INFO'}, "Voxel Brush active. Use the panel to switch Paint/Add/Remove; left-drag edits, I picks color, F resizes, right-click or Esc stops.")
+        self.report({'INFO'}, "Voxel Brush active. Modify Cubes adds by default; hold Shift while dragging to remove. Press Space to draw queued cube changes. I picks color, F resizes, right-click or Esc stops.")
         return {'RUNNING_MODAL'}
 
     def modal(self, context, event):
@@ -6513,6 +6553,7 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
             _, _, mouse_coord = get_mouse_region_coord(context, event)
             self._mouse_region_coord = mouse_coord
 
+        self._effective_mode = self.get_effective_mode(event)
         self.update_modal_cursor(context, event)
         settings = context.scene.miniature_voxeler_settings
         obj = get_blocks_object(settings)
@@ -6520,8 +6561,14 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
             return self.cancel_modal(context)
 
         self._active_brush_size = settings.lego_paint_brush_size
+        if self._is_editing and self._drag_effective_mode is not None and self._drag_effective_mode != self._effective_mode:
+            self._drag_face_dir = None
+            self._drag_plane_coord = None
+            self._drag_effective_mode = self._effective_mode
+            self._last_applied_target = None
+
         if (
-            self.mode == 'ADD' and
+            self._effective_mode == 'ADD' and
             self._is_editing and
             self._drag_face_dir is not None and
             mouse_coord is not None
@@ -6539,7 +6586,7 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
             )
             self.record_timing("hover", perf_counter() - hover_start)
         elif (
-            self.mode == 'REMOVE' and
+            self._effective_mode == 'REMOVE' and
             self._is_editing and
             self._drag_face_dir is not None and
             mouse_coord is not None
@@ -6554,20 +6601,20 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
                 self._drag_plane_coord,
             )
             self.record_timing("hover", perf_counter() - hover_start)
-        elif self.mode in {'ADD', 'REMOVE'} and mouse_coord is not None:
+        elif self._effective_mode in {'ADD', 'REMOVE'} and mouse_coord is not None:
             hover_start = perf_counter()
             self._hover_edit = get_voxel_cursor_edit_target(
                 context,
                 event,
                 obj,
-                self.mode,
+                self._effective_mode,
                 self._cells,
                 self._face_slots,
                 settings.selected_lego_palette_slot,
                 self._grid_cache,
             )
             self.record_timing("hover", perf_counter() - hover_start)
-        elif self.mode == 'PAINT':
+        elif self._effective_mode == 'PAINT':
             self._hover_edit = None
 
         if mouse_coord is None and event.type in {'LEFTMOUSE', 'MIDDLEMOUSE', 'RIGHTMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}:
@@ -6588,7 +6635,7 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
                 return {'RUNNING_MODAL'}
             return {'RUNNING_MODAL'}
 
-        if event.type == 'SPACE' and event.value == 'PRESS' and self.mode in {'ADD', 'REMOVE'}:
+        if event.type == 'SPACE' and event.value == 'PRESS' and self._effective_mode in {'ADD', 'REMOVE'}:
             self._is_editing = False
             self.commit_pending_voxel_edits(context, obj)
             return {'RUNNING_MODAL'}
@@ -6632,18 +6679,16 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
                 return {'RUNNING_MODAL'}
             return {'RUNNING_MODAL'}
 
-        if event.type in {'P', 'A', 'X'} and event.value == 'PRESS':
+        if event.type in {'P', 'A'} and event.value == 'PRESS':
             if event.type == 'P':
                 self.flush_pending_voxel_rebuild(context, obj)
             if event.type == 'P':
                 self.mode = 'PAINT'
                 self._face_centers_world = get_voxel_face_centers_world(obj)
-            elif event.type == 'A':
+            else:
                 self.mode = 'ADD'
                 self._face_centers_world = []
-            else:
-                self.mode = 'REMOVE'
-                self._face_centers_world = []
+            self._effective_mode = self.mode
             self._hover_edit = None
             self._drag_face_dir = None
             self._drag_plane_coord = None
@@ -6652,27 +6697,29 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
 
         if event.type == 'LEFTMOUSE':
             if event.value == 'PRESS':
-                if self.mode == 'PAINT':
+                if self._effective_mode == 'PAINT':
                     self.flush_pending_voxel_rebuild(context, obj)
-                elif self.mode == 'ADD' and self._hover_edit is not None:
+                elif self._effective_mode == 'ADD' and self._hover_edit is not None:
                     self._drag_face_dir = self._hover_edit.get("face_dir")
                     self._drag_plane_coord = self._hover_edit["target"][get_axis_for_face_dir(self._drag_face_dir)]
-                elif self.mode == 'REMOVE' and self._hover_edit is not None:
+                elif self._effective_mode == 'REMOVE' and self._hover_edit is not None:
                     self._drag_face_dir = self._hover_edit.get("face_dir")
                     self._drag_plane_coord = self._hover_edit["target"][get_axis_for_face_dir(self._drag_face_dir)]
                 self._is_editing = True
+                self._drag_effective_mode = self._effective_mode
                 self._last_applied_target = None
             elif event.value == 'RELEASE':
                 self._is_editing = False
-                if self.mode == 'PAINT':
+                if self._effective_mode == 'PAINT':
                     self.flush_pending_voxel_rebuild(context, obj)
                 self._drag_face_dir = None
                 self._drag_plane_coord = None
+                self._drag_effective_mode = None
                 self._last_applied_target = None
                 return {'RUNNING_MODAL'}
 
         if self._is_editing and event.type in {'LEFTMOUSE', 'MOUSEMOVE'}:
-            if self.mode == 'PAINT':
+            if self._effective_mode == 'PAINT':
                 changed = paint_faces_with_brush(
                     context,
                     event,
@@ -6695,6 +6742,87 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
 
         self.maybe_report_timing(context)
         return {'PASS_THROUGH'}
+
+
+class MINIATUREVOXELER_OT_set_palette_color(Operator):
+    bl_idname = "object.miniature_voxeler_set_palette_color"
+    bl_label = "Set Palette Color"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    slot_index: IntProperty(default=0, min=0, max=3)
+    palette_index: IntProperty(default=0, min=0, max=len(FIXED_LEGO_PALETTE) - 1)
+
+    @classmethod
+    def poll(cls, context):
+        return getattr(context.scene, "miniature_voxeler_settings", None) is not None
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        slot_index = max(0, min(int(self.slot_index), settings.lego_color_count - 1))
+        palette_index = max(0, min(int(self.palette_index), len(FIXED_LEGO_PALETTE) - 1))
+        setattr(settings, f"lego_palette_slot_{slot_index + 1}", str(palette_index))
+        settings.selected_lego_palette_slot = slot_index
+
+        obj = get_blocks_object(settings)
+        if obj is not None and not bool(obj.get("mv_debug_colors_active", False)):
+            ensure_slot_palette_materials(obj, settings)
+
+        self.report({'INFO'}, f"Slot {slot_index + 1}: {FIXED_LEGO_PALETTE[palette_index][0]}")
+        return {'FINISHED'}
+
+
+class MINIATUREVOXELER_OT_toggle_debug_colors(Operator):
+    bl_idname = "object.miniature_voxeler_toggle_debug_colors"
+    bl_label = "Debug Colors"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return has_blocks_object(context)
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        obj = get_blocks_object(settings)
+        if obj is None:
+            self.report({'ERROR'}, "Run Voxel Building first so the _Blocks object exists.")
+            return {'CANCELLED'}
+
+        ensure_slot_palette_materials(obj, settings)
+        active = bool(obj.get("mv_debug_colors_active", False))
+        backup_raw = obj.get("mv_debug_color_backup_json", "")
+
+        if active:
+            restored = False
+            try:
+                backup = json.loads(backup_raw) if backup_raw else []
+            except Exception:
+                backup = []
+
+            for slot_index in range(min(settings.lego_color_count, len(obj.data.materials))):
+                material = obj.data.materials[slot_index]
+                if slot_index < len(backup) and len(backup[slot_index]) >= 3:
+                    color = tuple(float(component) for component in backup[slot_index][:3])
+                else:
+                    color = get_slot_palette_color(settings, slot_index)
+                set_material_base_color(material, color)
+                restored = True
+
+            obj["mv_debug_colors_active"] = False
+            if "mv_debug_color_backup_json" in obj:
+                del obj["mv_debug_color_backup_json"]
+            self.report({'INFO'}, "Debug Colors restored palette colors." if restored else "Debug Colors off.")
+            return {'FINISHED'}
+
+        backup = []
+        for slot_index in range(min(settings.lego_color_count, len(obj.data.materials))):
+            material = obj.data.materials[slot_index]
+            backup.append(list(get_material_base_color(material)))
+            set_material_base_color(material, DEBUG_LEGO_COLORS[slot_index % len(DEBUG_LEGO_COLORS)])
+
+        obj["mv_debug_color_backup_json"] = json.dumps(backup, separators=(",", ":"))
+        obj["mv_debug_colors_active"] = True
+        self.report({'INFO'}, "Debug Colors active: slots preview as Red, Green, Blue, White.")
+        return {'FINISHED'}
 
 
 # ------------------------------------------------------------
@@ -8069,19 +8197,40 @@ class MINIATUREVOXELER_PT_panel(Panel):
             col.prop(settings, "lego_color_assign_mode")
             box.operator("object.miniature_voxeler_lego_color", text="Create Color Slots", icon='MATERIAL')
 
-            # Step 2.5 keeps face painting and cube editing in one always-available brush.
-            box = self.draw_step_box(layout, 'BUILDING', "2.5 Voxel Brush Editing")
+            # Step 2.5 smooths material assignments before manual brush edits.
+            box = self.draw_step_box(layout, 'BUILDING', "2.5 Smooth Colors")
+            smooth_col = box.column(align=True)
+            smooth_col.prop(settings, "lego_smooth_weight")
+            smooth_col.prop(settings, "lego_smooth_passes")
+            smooth_col.prop(settings, "lego_smooth_min_neighbors")
+            box.operator("object.miniature_voxeler_smooth_lego_color", icon='MOD_SMOOTH')
+
+            # Step 2.6 keeps face painting and cube editing in one always-available brush.
+            box = self.draw_step_box(layout, 'BUILDING', "2.6 Voxel Brush Editing")
             box.prop(settings, "lego_paint_brush_size")
-            box.prop(settings, "voxel_brush_debug")
-            palette_col = box.column(align=True)
+            debug_active = blocks_obj is not None and bool(blocks_obj.get("mv_debug_colors_active", False))
+            box.operator(
+                "object.miniature_voxeler_toggle_debug_colors",
+                text="Debug Colors",
+                icon='MATERIAL',
+                depress=debug_active,
+            )
+
             active_brush = MINIATUREVOXELER_OT_voxel_brush_tool._active_tool
 
+            selected_col = box.column(align=True)
             for slot_index in range(settings.lego_color_count):
-                row = palette_col.row(align=True)
+                fixed_index = int(getattr(settings, f"lego_palette_slot_{slot_index + 1}"))
+                row = selected_col.row(align=True)
                 swatch = row.row(align=True)
                 swatch.enabled = False
-                swatch.prop(settings, f"lego_palette_slot_color_{slot_index + 1}", text="")
-                row.prop(settings, f"lego_palette_slot_{slot_index + 1}")
+                if debug_active:
+                    swatch.prop(settings, f"debug_palette_slot_color_{slot_index + 1}", text="")
+                    debug_names = ("Red", "Green", "Blue", "White")
+                    row.label(text=f"Slot {slot_index + 1}: Debug {debug_names[slot_index]}")
+                else:
+                    swatch.prop(settings, f"lego_palette_slot_color_{slot_index + 1}", text="")
+                    row.label(text=f"Slot {slot_index + 1}: {FIXED_LEGO_PALETTE[fixed_index][0]}")
                 is_active_paint_slot = (
                     active_brush is not None and
                     not getattr(active_brush, "_cancel_requested", False) and
@@ -8098,23 +8247,29 @@ class MINIATUREVOXELER_PT_panel(Panel):
                 op.mode = 'PAINT'
                 op.slot_index = slot_index
 
-            voxel_row = box.row(align=True)
-            is_add_active = active_brush is not None and not getattr(active_brush, "_cancel_requested", False) and active_brush.mode == 'ADD'
-            is_remove_active = active_brush is not None and not getattr(active_brush, "_cancel_requested", False) and active_brush.mode == 'REMOVE'
-            add_op = voxel_row.operator("object.miniature_voxeler_voxel_brush_tool", text="Add Cubes", icon='ADD', depress=is_add_active)
-            add_op.mode = 'ADD'
-            add_op.slot_index = settings.selected_lego_palette_slot
-            remove_op = voxel_row.operator("object.miniature_voxeler_voxel_brush_tool", text="Remove Cubes", icon='REMOVE', depress=is_remove_active)
-            remove_op.mode = 'REMOVE'
-            remove_op.slot_index = settings.selected_lego_palette_slot
+            active_slot = min(settings.selected_lego_palette_slot, settings.lego_color_count - 1)
+            box.label(text=f"Palette For Slot {active_slot + 1}")
+            palette_grid = box.grid_flow(row_major=True, columns=4, even_columns=True, even_rows=False, align=True)
+            for palette_index, (_palette_name, _palette_color) in enumerate(FIXED_LEGO_PALETTE):
+                cell = palette_grid.column(align=True)
+                swatch_row = cell.row(align=True)
+                swatch_row.enabled = False
+                swatch_row.prop(settings, f"fixed_palette_color_{palette_index + 1}", text="")
+                current_index = int(getattr(settings, f"lego_palette_slot_{active_slot + 1}"))
+                op = cell.operator(
+                    "object.miniature_voxeler_set_palette_color",
+                    text="",
+                    icon='RADIOBUT_ON' if current_index == palette_index else 'RADIOBUT_OFF',
+                    depress=current_index == palette_index,
+                )
+                op.slot_index = active_slot
+                op.palette_index = palette_index
 
-            # Step 2.6 smooths material assignments after manual edits if needed.
-            box = self.draw_step_box(layout, 'BUILDING', "2.6 Smooth Colors")
-            smooth_col = box.column(align=True)
-            smooth_col.prop(settings, "lego_smooth_weight")
-            smooth_col.prop(settings, "lego_smooth_passes")
-            smooth_col.prop(settings, "lego_smooth_min_neighbors")
-            box.operator("object.miniature_voxeler_smooth_lego_color", icon='MOD_SMOOTH')
+            voxel_row = box.row(align=True)
+            is_modify_active = active_brush is not None and not getattr(active_brush, "_cancel_requested", False) and active_brush.mode == 'ADD'
+            modify_op = voxel_row.operator("object.miniature_voxeler_voxel_brush_tool", text="Modify Cubes", icon='MOD_BUILD', depress=is_modify_active)
+            modify_op.mode = 'ADD'
+            modify_op.slot_index = settings.selected_lego_palette_slot
 
             # Step 2.7 exports the colored building shell pieces for downstream use.
             box = self.draw_step_box(layout, 'BUILDING', "2.7 Export Pieces")
@@ -8151,6 +8306,8 @@ classes = (
     MINIATUREVOXELER_OT_paint_lego_slot,
     MINIATUREVOXELER_OT_edit_voxel_cells,
     MINIATUREVOXELER_OT_voxel_brush_tool,
+    MINIATUREVOXELER_OT_set_palette_color,
+    MINIATUREVOXELER_OT_toggle_debug_colors,
     MINIATUREVOXELER_OT_generate_color_skin,
     MINIATUREVOXELER_OT_prepare_platform_copy,
     MINIATUREVOXELER_OT_prepare_platform_walls_selection,
