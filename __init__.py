@@ -172,15 +172,16 @@ def update_palette_slot_material(settings, context, slot_index):
 
     obj = get_blocks_object(settings)
     if obj is None:
+        apply_platform_foot_color_slot(settings)
         return
     if bool(obj.get("mv_debug_colors_active", False)):
+        apply_platform_foot_color_slot(settings)
         return
 
-    if slot_index >= len(obj.data.materials):
-        return
-
-    set_material_base_color(obj.data.materials[slot_index], color)
-    obj.data.update()
+    if slot_index < len(obj.data.materials):
+        set_material_base_color(obj.data.materials[slot_index], color)
+        obj.data.update()
+    apply_platform_foot_color_slot(settings)
 
 
 def update_lego_palette_slot_1(settings, context):
@@ -210,6 +211,10 @@ def update_color_skin_base_slot(settings, context):
 def update_lego_color_count(settings, context):
     if settings.selected_lego_palette_slot >= settings.lego_color_count:
         settings.selected_lego_palette_slot = settings.lego_color_count - 1
+
+
+def update_platform_foot_color_slot(settings, context):
+    apply_platform_foot_color_slot(settings)
 
 
 def get_source_validation_key(building_obj, platform_obj):
@@ -2060,6 +2065,19 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
         max=3,
     )
 
+    platform_foot_color_slot: EnumProperty(
+        name="_foot Slot",
+        description="Palette slot assigned to the _foot object",
+        items=[
+            ('0', "Slot 1", "Color _foot with slot 1"),
+            ('1', "Slot 2", "Color _foot with slot 2"),
+            ('2', "Slot 3", "Color _foot with slot 3"),
+            ('3', "Slot 4", "Color _foot with slot 4"),
+        ],
+        default='0',
+        update=update_platform_foot_color_slot,
+    )
+
     debug_palette_slot_color_1: FloatVectorProperty(name="Debug Red", subtype='COLOR', size=3, min=0.0, max=1.0, default=DEBUG_LEGO_COLORS[0])
     debug_palette_slot_color_2: FloatVectorProperty(name="Debug Green", subtype='COLOR', size=3, min=0.0, max=1.0, default=DEBUG_LEGO_COLORS[1])
     debug_palette_slot_color_3: FloatVectorProperty(name="Debug Blue", subtype='COLOR', size=3, min=0.0, max=1.0, default=DEBUG_LEGO_COLORS[2])
@@ -2294,10 +2312,22 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
         default=False,
     )
 
+    platform_slice_boolean_self_intersect: BoolProperty(
+        name="Self Intersect",
+        description="Allow self-intersecting geometry when slicing the building with the platform cutter",
+        default=False,
+    )
+
+    platform_slice_boolean_holes: BoolProperty(
+        name="Holes",
+        description="Use Blender's hole-tolerant boolean mode when slicing the building with the platform cutter",
+        default=False,
+    )
+
     voxel_xy_wall_layers: IntProperty(
         name="XY Wall Layers",
         description="Number of exterior XY side-wall voxel layers to remove after voxelizing",
-        default=1,
+        default=2,
         min=0,
         max=50,
     )
@@ -3027,6 +3057,21 @@ def cleanup_boolean_mesh(context, obj, triangulate=False):
         bpy.ops.mesh.select_all(action='SELECT')
         bpy.ops.mesh.quads_convert_to_tris()
     bpy.ops.object.mode_set(mode='OBJECT')
+
+
+def recalculate_normals_outside(context, obj):
+    if obj is None or obj.type != 'MESH':
+        return False
+
+    set_active_object(context, obj)
+    if context.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_mode(type='FACE')
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.mesh.normals_make_consistent(inside=False)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    return True
 
 
 def segments_cross_xy(a1, a2, b1, b2, epsilon=1e-14):
@@ -5476,6 +5521,27 @@ def ensure_slot_palette_materials(obj, settings):
     mesh.update()
 
 
+def apply_platform_foot_color_slot(settings):
+    foot_obj = get_platform_foot_object(settings)
+    if foot_obj is None:
+        return False
+
+    slot_index = max(0, min(int(settings.platform_foot_color_slot), 3))
+    blocks_obj = get_blocks_object(settings)
+    material = None
+
+    if blocks_obj is not None and not bool(blocks_obj.get("mv_debug_colors_active", False)):
+        ensure_slot_palette_materials(blocks_obj, settings)
+        if slot_index < len(blocks_obj.data.materials):
+            material = blocks_obj.data.materials[slot_index]
+
+    if material is None:
+        material = ensure_lego_color_material(foot_obj, slot_index, get_slot_palette_color(settings, slot_index))
+
+    apply_single_material_to_object(foot_obj, material)
+    return True
+
+
 def smooth_material_assignments(mesh, weight, passes, min_neighbors):
     neighbor_map = {poly.index: set() for poly in mesh.polygons}
     edge_faces = {}
@@ -5884,6 +5950,8 @@ class MINIATUREVOXELER_OT_lego_color(Operator):
         sync_slot_palette_properties(settings, palette)
         rebuild_materials_from_assignments(obj, settings, assignments, len(palette))
         sync_voxel_color_state_from_mesh(obj)
+        settings.platform_foot_color_slot = '0'
+        apply_platform_foot_color_slot(settings)
 
         self.report(
             {'INFO'},
@@ -6517,8 +6585,18 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
         return 1
 
     def commit_pending_voxel_edits(self, context, obj=None, report=True):
+        pending_undo = []
+        if getattr(self, "_pending_rebuild", False):
+            for batch in getattr(self, "_voxel_preview_undo_stack", []):
+                pending_undo.extend(batch)
+
         committed = self.flush_pending_voxel_rebuild(context, obj)
         if committed:
+            if pending_undo:
+                self._voxel_apply_undo_stack.append(pending_undo)
+                if len(self._voxel_apply_undo_stack) > 50:
+                    self._voxel_apply_undo_stack.pop(0)
+            self._voxel_preview_undo_stack.clear()
             self._last_applied_target = None
             self._drag_face_dir = None
             self._drag_plane_coord = None
@@ -6527,6 +6605,56 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
         elif report:
             self.report({'INFO'}, "No queued voxel edits to commit.")
         return committed
+
+    def undo_voxel_batch(self, context, obj, batch, rebuild=True):
+        if not batch:
+            return 0
+
+        for item in reversed(batch):
+            action = item["action"]
+            coord = item["coord"]
+            if action == 'ADD':
+                if coord in self._cells:
+                    del self._cells[coord]
+                self._pending_added.discard(coord)
+                self._pending_removed.discard(coord)
+                for key in list(self._face_slots.keys()):
+                    if key[:3] == coord:
+                        del self._face_slots[key]
+            elif action == 'REMOVE':
+                self._cells[coord] = item["slot"]
+                self._pending_added.discard(coord)
+                self._pending_removed.discard(coord)
+                for key, value in item.get("face_slots", {}).items():
+                    self._face_slots[key] = value
+                expand_voxel_grid_cache(getattr(self, "_grid_cache", None), coord)
+
+        self._last_applied_target = None
+        self._drag_face_dir = None
+        self._drag_plane_coord = None
+        self._pending_rebuild = True
+        if rebuild:
+            self.flush_pending_voxel_rebuild(context, obj)
+        elif context.area:
+            context.area.tag_redraw()
+        return 1
+
+    def undo_last_voxel_edit(self, context, obj=None):
+        undo_stack = getattr(self, "_voxel_preview_undo_stack", [])
+        if not undo_stack:
+            apply_stack = getattr(self, "_voxel_apply_undo_stack", [])
+            if not apply_stack:
+                self.report({'INFO'}, "No voxel brush edits to undo.")
+                return 0
+            if self.undo_voxel_batch(context, obj, apply_stack.pop()):
+                self.report({'INFO'}, "Undid last applied voxel edit.")
+                return 1
+            return 0
+
+        if self.undo_voxel_batch(context, obj, undo_stack.pop(), rebuild=False):
+            self.report({'INFO'}, "Undid last preview voxel brush edit.")
+            return 1
+        return 1
 
     def maybe_flush_visible_voxel_rebuild(self, context, obj):
         if not getattr(self, "_pending_rebuild", False):
@@ -6580,6 +6708,7 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
             return 0
 
         changed_count = 0
+        undo_batch = []
         if effective_mode == 'ADD':
             direction = get_voxel_cell_face_vectors()[hover.get("face_dir", 4)]
             for target in target_coords:
@@ -6600,6 +6729,10 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
                     source_face_dir=hover.get("face_dir"),
                     fallback_slot=hover.get("fallback_slot", self.slot_index),
                 )
+                undo_batch.append({
+                    "action": 'ADD',
+                    "coord": target,
+                })
                 self._cells[target] = int(slot)
                 expand_voxel_grid_cache(getattr(self, "_grid_cache", None), target)
                 self._pending_added.add(target)
@@ -6609,6 +6742,15 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
             for target in target_coords:
                 if target not in self._cells:
                     continue
+                undo_batch.append({
+                    "action": 'REMOVE',
+                    "coord": target,
+                    "slot": int(self._cells[target]),
+                    "face_slots": {
+                        key: value for key, value in self._face_slots.items()
+                        if key[:3] == target
+                    },
+                })
                 del self._cells[target]
                 self._pending_removed.add(target)
                 self._pending_added.discard(target)
@@ -6621,6 +6763,11 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
 
         if changed_count == 0:
             return 0
+
+        if undo_batch:
+            self._voxel_preview_undo_stack.append(undo_batch)
+            if len(self._voxel_preview_undo_stack) > 100:
+                self._voxel_preview_undo_stack.pop(0)
 
         self._last_applied_target = signature
         self._pending_rebuild = True
@@ -6682,6 +6829,8 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
         self._last_visible_rebuild_time = 0.0
         self._pending_added = set()
         self._pending_removed = set()
+        self._voxel_preview_undo_stack = []
+        self._voxel_apply_undo_stack = []
         self._last_applied_target = None
         self._drag_face_dir = None
         self._drag_plane_coord = None
@@ -6809,6 +6958,11 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
                 settings.lego_paint_brush_size = self._brush_resize_start_size
                 self._is_resizing_brush = False
                 return {'RUNNING_MODAL'}
+            return {'RUNNING_MODAL'}
+
+        if event.type == 'Z' and event.value == 'PRESS' and getattr(event, "ctrl", False) and self._effective_mode in {'ADD', 'REMOVE'}:
+            self._is_editing = False
+            self.undo_last_voxel_edit(context, obj)
             return {'RUNNING_MODAL'}
 
         if event.type == 'SPACE' and event.value == 'PRESS' and self._effective_mode in {'ADD', 'REMOVE'}:
@@ -7632,6 +7786,10 @@ class MINIATUREVOXELER_OT_select_platform_upper_ring(Operator):
             self.report({'ERROR'}, "Separate hole walls first so the rings object exists.")
             return {'CANCELLED'}
 
+        hole_selection_obj = get_platform_copy_object(settings)
+        if hole_selection_obj is not None:
+            hole_selection_obj.hide_set(True)
+
         set_active_object(context, rings_obj)
         bpy.ops.object.mode_set(mode='EDIT')
         bpy.ops.mesh.select_mode(type='EDGE')
@@ -8170,6 +8328,7 @@ class MINIATUREVOXELER_OT_build_platform_walls_mesh(Operator):
             self.report({'ERROR'}, "The cutter needs closed 2D faces before extrusion.")
             return {'CANCELLED'}
 
+        recalculate_normals_outside(context, cutter_obj)
         cutter_obj["mv_platform_stage"] = "building_cutter_3d"
         set_active_object(context, cutter_obj)
         self.report({'INFO'}, f"Extruded {cutter_obj.name} downward by {settings.platform_cutter_depth_mm:.3f} mm.")
@@ -8260,6 +8419,10 @@ class MINIATUREVOXELER_OT_build_platform_foot_mesh(Operator):
         foot_mod.object = cutter_obj
         if hasattr(foot_mod, "solver"):
             foot_mod.solver = 'EXACT'
+        if hasattr(foot_mod, "use_self"):
+            foot_mod.use_self = settings.platform_slice_boolean_self_intersect
+        if hasattr(foot_mod, "use_hole_tolerant"):
+            foot_mod.use_hole_tolerant = settings.platform_slice_boolean_holes
         bpy.ops.object.modifier_apply(modifier=foot_mod.name)
 
         set_active_object(context, working_building_obj)
@@ -8268,6 +8431,10 @@ class MINIATUREVOXELER_OT_build_platform_foot_mesh(Operator):
         copy_mod.object = cutter_obj
         if hasattr(copy_mod, "solver"):
             copy_mod.solver = 'EXACT'
+        if hasattr(copy_mod, "use_self"):
+            copy_mod.use_self = settings.platform_slice_boolean_self_intersect
+        if hasattr(copy_mod, "use_hole_tolerant"):
+            copy_mod.use_hole_tolerant = settings.platform_slice_boolean_holes
         bpy.ops.object.modifier_apply(modifier=copy_mod.name)
 
         foot_obj["mv_platform_stage"] = "foot_from_building_slice"
@@ -8382,8 +8549,6 @@ class MINIATUREVOXELER_PT_panel(Panel):
         row = col.row(align=True)
         row.operator("object.mv_platform_walls_merge", text="Merge By Distance", icon='AUTOMERGE_ON')
         row.operator("object.mv_platform_walls_merge_center", text="Merge At Center", icon='PIVOT_MEDIAN')
-        col.prop(settings, "platform_cleanup_dissolve_angle")
-        col.operator("object.mv_platform_cleanup_limited_dissolve", text="Limited Dissolve", icon='MOD_DECIM')
 
     def draw(self, context):
         layout = self.layout
@@ -8502,6 +8667,10 @@ class MINIATUREVOXELER_PT_panel(Panel):
 
             # Step 1.12 uses the platform cutter to split the building body and print foot.
             box = self.draw_step_box(layout, 'PLATFORM', "1.12 Slice Building")
+            slice_col = box.column(align=True)
+            slice_col.alert = True
+            slice_col.prop(settings, "platform_slice_boolean_self_intersect")
+            slice_col.prop(settings, "platform_slice_boolean_holes")
             box.operator("object.mv_platform_building_slice", text="Slice Building And Create _foot", icon='SELECT_DIFFERENCE')
             if foot_obj is not None:
                 box.label(text=f"Current foot object: {foot_obj.name}")
@@ -8535,15 +8704,16 @@ class MINIATUREVOXELER_PT_panel(Panel):
 
             # Step 2.4 bakes the building texture and turns it into fixed Lego color slots.
             box = self.draw_step_box(layout, 'BUILDING', "2.4 Texture And Color")
-            col = box.column(align=True)
             box.operator("object.miniature_voxeler_smart_uv_project", text="Generate UVs", icon='UV')
-            col.prop(settings, "texture_source_name")
-            col.prop(settings, "texture_size")
-            col.prop(settings, "texture_margin")
+            texture_col = box.column(align=True)
+            texture_col.prop(settings, "texture_source_name")
+            texture_col.prop(settings, "texture_size")
+            texture_col.prop(settings, "texture_margin")
             box.operator("object.miniature_voxeler_transfer_texture", text="Transfer Texture", icon='TEXTURE')
-            col.prop(settings, "lego_color_count")
-            col.prop(settings, "lego_color_sample_mode")
-            col.prop(settings, "lego_color_assign_mode")
+            color_col = box.column(align=True)
+            color_col.prop(settings, "lego_color_count")
+            color_col.prop(settings, "lego_color_sample_mode")
+            color_col.prop(settings, "lego_color_assign_mode")
             box.operator("object.miniature_voxeler_lego_color", text="Create Color Slots", icon='MATERIAL')
 
             # Step 2.5 smooths material assignments before manual brush edits.
@@ -8595,6 +8765,8 @@ class MINIATUREVOXELER_PT_panel(Panel):
                 )
                 op.mode = 'PAINT'
                 op.slot_index = slot_index
+
+            box.prop(settings, "platform_foot_color_slot")
 
             active_slot = min(settings.selected_lego_palette_slot, settings.lego_color_count - 1)
             box.label(text=f"Palette For Slot {active_slot + 1}")
