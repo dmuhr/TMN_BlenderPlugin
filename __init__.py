@@ -19,7 +19,7 @@ from gpu_extras.batch import batch_for_shader
 from math import atan2, cos, floor, hypot, pi, radians, sin
 from time import perf_counter
 from bpy_extras import view3d_utils
-from mathutils import Vector
+from mathutils import Vector, geometry
 from bpy.types import Operator, Panel, PropertyGroup
 from bpy.props import (
     IntProperty,
@@ -507,6 +507,91 @@ def collect_box_face_indices(context, obj, start_coord, end_coord, face_centers_
         if screen_coord is None:
             continue
         if not (min_x <= screen_coord.x <= max_x and min_y <= screen_coord.y <= max_y):
+            continue
+        if raycast_face_at_region_coord(context, obj, region, region_3d, screen_coord) == poly.index:
+            face_indices.add(poly.index)
+
+    return face_indices
+
+
+def normalize_lasso_coords(lasso_coords):
+    coords = []
+    for coord in lasso_coords:
+        point = (float(coord[0]), float(coord[1]))
+        if not coords or hypot(point[0] - coords[-1][0], point[1] - coords[-1][1]) >= 0.5:
+            coords.append(point)
+    if len(coords) > 2 and hypot(coords[0][0] - coords[-1][0], coords[0][1] - coords[-1][1]) < 0.5:
+        coords.pop()
+    return coords
+
+
+def point_in_triangle_2d(point, a, b, c):
+    px, py = point
+    ax, ay = a
+    bx, by = b
+    cx, cy = c
+
+    d1 = ((px - bx) * (ay - by)) - ((ax - bx) * (py - by))
+    d2 = ((px - cx) * (by - cy)) - ((bx - cx) * (py - cy))
+    d3 = ((px - ax) * (cy - ay)) - ((cx - ax) * (py - ay))
+    has_negative = d1 < -1e-6 or d2 < -1e-6 or d3 < -1e-6
+    has_positive = d1 > 1e-6 or d2 > 1e-6 or d3 > 1e-6
+    return not (has_negative and has_positive)
+
+
+def build_lasso_triangles_2d(lasso_coords):
+    coords = normalize_lasso_coords(lasso_coords)
+    if len(coords) < 3:
+        return [], []
+
+    vertices = [Vector((coord[0], coord[1], 0.0)) for coord in coords]
+    try:
+        triangle_indices = geometry.tessellate_polygon([vertices])
+    except Exception:
+        triangle_indices = []
+
+    triangles = []
+    for triangle in triangle_indices:
+        if len(triangle) == 3:
+            triangles.append((coords[triangle[0]], coords[triangle[1]], coords[triangle[2]]))
+    return coords, triangles
+
+
+def point_in_lasso_triangles_2d(point, triangles):
+    return any(point_in_triangle_2d(point, a, b, c) for a, b, c in triangles)
+
+
+def collect_lasso_face_indices(context, obj, lasso_coords, face_centers_world=None):
+    if obj is None or not lasso_coords or len(lasso_coords) < 3:
+        return set()
+
+    lasso_coords, lasso_triangles = build_lasso_triangles_2d(lasso_coords)
+    if not lasso_triangles:
+        return set()
+
+    region = get_view3d_window_region(context.area)
+    region_3d = getattr(context.space_data, "region_3d", None)
+    if region is None or region_3d is None:
+        return set()
+
+    min_x = min(coord[0] for coord in lasso_coords)
+    max_x = max(coord[0] for coord in lasso_coords)
+    min_y = min(coord[1] for coord in lasso_coords)
+    max_y = max(coord[1] for coord in lasso_coords)
+    mesh = obj.data
+    face_indices = set()
+
+    for poly in mesh.polygons:
+        if face_centers_world is not None and poly.index < len(face_centers_world):
+            center = face_centers_world[poly.index]
+        else:
+            center = obj.matrix_world @ get_polygon_center(mesh, poly)
+        screen_coord = view3d_utils.location_3d_to_region_2d(region, region_3d, center)
+        if screen_coord is None:
+            continue
+        if not (min_x <= screen_coord.x <= max_x and min_y <= screen_coord.y <= max_y):
+            continue
+        if not point_in_lasso_triangles_2d((screen_coord.x, screen_coord.y), lasso_triangles):
             continue
         if raycast_face_at_region_coord(context, obj, region, region_3d, screen_coord) == poly.index:
             face_indices.add(poly.index)
@@ -2208,6 +2293,7 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
         items=[
             ('PAINT', "Brush", "Paint the selected slot with the circular brush"),
             ('BOX_PAINT', "Rectangle", "Paint the selected slot inside a dragged rectangle"),
+            ('LASSO_PAINT', "Lasso", "Paint the selected slot inside a freehand lasso shape"),
         ],
         default='PAINT',
     )
@@ -6674,6 +6760,7 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
         items=[
             ('PAINT', "Paint", "Paint visible voxel faces"),
             ('BOX_PAINT', "Rectangle Paint", "Paint visible voxel faces inside a dragged rectangle"),
+            ('LASSO_PAINT', "Lasso Paint", "Paint visible voxel faces inside a freehand lasso"),
             ('ADD', "Modify Cubes", "Add cubes on the voxel grid; hold Shift while dragging to remove cubes"),
             ('REMOVE', "Remove Cubes", "Remove cubes from the voxel grid"),
         ],
@@ -6687,15 +6774,21 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
     def draw_brush_overlay(operator, context):
         if operator.mode == 'PAINT' or getattr(operator, "_is_resizing_brush", False):
             MINIATUREVOXELER_OT_paint_lego_slot.draw_brush_overlay(operator, context)
-        if not getattr(operator, "_is_box_painting", False):
+        if getattr(operator, "_is_lasso_painting", False):
+            coords = list(getattr(operator, "_lasso_paint_coords", []))
+            if len(coords) < 2:
+                return
+            coords.append(coords[0])
+        elif getattr(operator, "_is_box_painting", False):
+            start_coord = getattr(operator, "_box_paint_start", None)
+            end_coord = getattr(operator, "_box_paint_end", None)
+            if start_coord is None or end_coord is None:
+                return
+            x1, y1 = start_coord
+            x2, y2 = end_coord
+            coords = [(x1, y1), (x2, y1), (x2, y2), (x1, y2), (x1, y1)]
+        else:
             return
-        start_coord = getattr(operator, "_box_paint_start", None)
-        end_coord = getattr(operator, "_box_paint_end", None)
-        if start_coord is None or end_coord is None:
-            return
-        x1, y1 = start_coord
-        x2, y2 = end_coord
-        coords = [(x1, y1), (x2, y1), (x2, y2), (x1, y2), (x1, y1)]
 
         try:
             shader = gpu.shader.from_builtin('UNIFORM_COLOR')
@@ -6780,7 +6873,7 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
         effective_mode = self.get_effective_mode(event)
         if getattr(self, "_is_picking_color", False):
             cursor = 'EYEDROPPER'
-        elif self.mode == 'BOX_PAINT':
+        elif self.mode in {'BOX_PAINT', 'LASSO_PAINT'}:
             cursor = 'CROSSHAIR'
         elif effective_mode == 'PAINT':
             cursor = 'PAINT_BRUSH'
@@ -6827,7 +6920,7 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
     def get_effective_mode(self, event=None):
         if self.mode == 'ADD' and event is not None and getattr(event, "shift", False):
             return 'REMOVE'
-        if self.mode == 'BOX_PAINT':
+        if self.mode in {'BOX_PAINT', 'LASSO_PAINT'}:
             return 'PAINT'
         return self.mode
 
@@ -7078,14 +7171,14 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
         if "mv_voxel_cells_json" not in obj:
             self.report({'ERROR'}, "This _Blocks object was not generated by the custom voxelizer.")
             return {'CANCELLED'}
-        if self.mode in {'PAINT', 'BOX_PAINT'} and self.slot_index >= settings.lego_color_count:
+        if self.mode in {'PAINT', 'BOX_PAINT', 'LASSO_PAINT'} and self.slot_index >= settings.lego_color_count:
             self.report({'ERROR'}, "This paint slot is not enabled by Number of Colors.")
             return {'CANCELLED'}
         if context.area is None or context.area.type != 'VIEW_3D':
             self.report({'ERROR'}, "Start Voxel Brush from a 3D View.")
             return {'CANCELLED'}
 
-        if self.mode in {'PAINT', 'BOX_PAINT'} and context.mode == 'EDIT_MESH' and context.edit_object == obj:
+        if self.mode in {'PAINT', 'BOX_PAINT', 'LASSO_PAINT'} and context.mode == 'EDIT_MESH' and context.edit_object == obj:
             changed_count = assign_selected_edit_faces_to_slot(obj, settings, self.slot_index)
             if changed_count == 0:
                 self.report({'WARNING'}, f"No selected faces to assign to slot {self.slot_index + 1}.")
@@ -7097,24 +7190,28 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
         ensure_slot_palette_materials(obj, settings)
-        if self.mode in {'PAINT', 'BOX_PAINT'}:
+        if self.mode in {'PAINT', 'BOX_PAINT', 'LASSO_PAINT'}:
             settings.lego_paint_tool_mode = self.mode
             settings.selected_lego_palette_slot = self.slot_index
 
         previous = type(self)._active_tool
         if previous is not None and previous is not self and not getattr(previous, "_cancel_requested", False):
             if previous.mode == self.mode and previous.slot_index == self.slot_index:
-                if self.mode == 'BOX_PAINT':
+                if self.mode in {'BOX_PAINT', 'LASSO_PAINT'}:
                     previous._is_box_paint_armed = (self.mode == 'BOX_PAINT')
                     previous._is_box_painting = False
+                    previous._is_lasso_paint_armed = (self.mode == 'LASSO_PAINT')
+                    previous._is_lasso_painting = False
                     previous._box_paint_start = None
                     previous._box_paint_end = None
-                    self.report({'INFO'}, f"Rectangle paint ready for slot {self.slot_index + 1}.")
+                    previous._lasso_paint_coords = []
+                    tool_label = "Rectangle" if self.mode == 'BOX_PAINT' else "Lasso"
+                    self.report({'INFO'}, f"{tool_label} paint ready for slot {self.slot_index + 1}.")
                     return {'FINISHED'}
                 previous._cancel_requested = True
                 previous._cancel_message = "Voxel brush finished."
                 return {'FINISHED'}
-            if self.mode in {'PAINT', 'BOX_PAINT'}:
+            if self.mode in {'PAINT', 'BOX_PAINT', 'LASSO_PAINT'}:
                 previous.flush_pending_voxel_rebuild(context, obj)
             previous.mode = self.mode
             previous.slot_index = self.slot_index
@@ -7123,12 +7220,15 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
             previous._is_resizing_brush = False
             previous._is_box_paint_armed = (self.mode == 'BOX_PAINT')
             previous._is_box_painting = False
+            previous._is_lasso_paint_armed = (self.mode == 'LASSO_PAINT')
+            previous._is_lasso_painting = False
             previous._box_paint_start = None
             previous._box_paint_end = None
+            previous._lasso_paint_coords = []
             previous._hover_edit = None
-            if self.mode not in {'PAINT', 'BOX_PAINT'}:
+            if self.mode not in {'PAINT', 'BOX_PAINT', 'LASSO_PAINT'}:
                 previous._face_centers_world = []
-            if self.mode in {'PAINT', 'BOX_PAINT'}:
+            if self.mode in {'PAINT', 'BOX_PAINT', 'LASSO_PAINT'}:
                 settings.selected_lego_palette_slot = self.slot_index
                 previous._face_centers_world = get_voxel_face_centers_world(obj)
             previous._effective_mode = previous.mode
@@ -7146,8 +7246,11 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
         self._is_resizing_brush = False
         self._is_box_paint_armed = (self.mode == 'BOX_PAINT')
         self._is_box_painting = False
+        self._is_lasso_paint_armed = (self.mode == 'LASSO_PAINT')
+        self._is_lasso_painting = False
         self._box_paint_start = None
         self._box_paint_end = None
+        self._lasso_paint_coords = []
         self._pending_rebuild = False
         self._last_visible_rebuild_time = 0.0
         self._pending_added = set()
@@ -7170,10 +7273,10 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
         self._cells = deserialize_voxel_cells(obj)
         self._grid_cache = build_voxel_grid_cache(obj, self._cells)
         self._face_slots = deserialize_voxel_face_slots(obj)
-        if not self._face_slots and self.mode in {'PAINT', 'BOX_PAINT'}:
+        if not self._face_slots and self.mode in {'PAINT', 'BOX_PAINT', 'LASSO_PAINT'}:
             self._face_slots = collect_voxel_face_slots_from_mesh(obj, self._cells)
-        self._face_centers_world = get_voxel_face_centers_world(obj) if self.mode in {'PAINT', 'BOX_PAINT'} else []
-        if self.mode in {'PAINT', 'BOX_PAINT'}:
+        self._face_centers_world = get_voxel_face_centers_world(obj) if self.mode in {'PAINT', 'BOX_PAINT', 'LASSO_PAINT'} else []
+        if self.mode in {'PAINT', 'BOX_PAINT', 'LASSO_PAINT'}:
             settings.selected_lego_palette_slot = self.slot_index
 
         type(self)._active_tool = self
@@ -7285,7 +7388,9 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
 
         if (
             getattr(self, "_is_box_paint_armed", False) or
-            getattr(self, "_is_box_painting", False)
+            getattr(self, "_is_box_painting", False) or
+            getattr(self, "_is_lasso_paint_armed", False) or
+            getattr(self, "_is_lasso_painting", False)
         ):
             if event.type == 'I' and event.value == 'PRESS':
                 self.flush_pending_voxel_rebuild(context, obj)
@@ -7293,34 +7398,76 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
                 self._is_editing = False
                 self._is_box_paint_armed = False
                 self._is_box_painting = False
+                self._is_lasso_paint_armed = False
+                self._is_lasso_painting = False
                 self._box_paint_start = None
                 self._box_paint_end = None
+                self._lasso_paint_coords = []
                 self.update_modal_cursor(context, event)
                 self.report({'INFO'}, "Color picker active. Click a face to pick its slot.")
                 return {'RUNNING_MODAL'}
             if event.type in {'RIGHTMOUSE', 'ESC'} and event.value == 'PRESS':
                 self._is_box_paint_armed = False
                 self._is_box_painting = False
+                self._is_lasso_paint_armed = False
+                self._is_lasso_painting = False
                 self._box_paint_start = None
                 self._box_paint_end = None
-                self.report({'INFO'}, "Rectangle paint canceled.")
+                self._lasso_paint_coords = []
+                self.report({'INFO'}, "Shape paint canceled.")
                 return {'RUNNING_MODAL'}
             if mouse_coord is None:
                 return {'PASS_THROUGH'}
             if (
-                getattr(self, "_is_box_paint_armed", False) and
+                (getattr(self, "_is_box_paint_armed", False) or getattr(self, "_is_lasso_paint_armed", False)) and
                 not getattr(self, "_is_box_painting", False) and
+                not getattr(self, "_is_lasso_painting", False) and
                 event.type != 'LEFTMOUSE'
             ):
                 return {'PASS_THROUGH'}
             if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
-                self._is_box_paint_armed = False
-                self._is_box_painting = True
-                self._box_paint_start = mouse_coord
-                self._box_paint_end = mouse_coord
+                if getattr(self, "_is_lasso_paint_armed", False):
+                    self._is_lasso_paint_armed = False
+                    self._is_lasso_painting = True
+                    self._lasso_paint_coords = [mouse_coord]
+                else:
+                    self._is_box_paint_armed = False
+                    self._is_box_painting = True
+                    self._box_paint_start = mouse_coord
+                    self._box_paint_end = mouse_coord
+                return {'RUNNING_MODAL'}
+            if self._is_lasso_painting and event.type == 'MOUSEMOVE':
+                coords = getattr(self, "_lasso_paint_coords", [])
+                if not coords or hypot(mouse_coord[0] - coords[-1][0], mouse_coord[1] - coords[-1][1]) >= 2.0:
+                    coords.append(mouse_coord)
+                    self._lasso_paint_coords = coords
                 return {'RUNNING_MODAL'}
             if self._is_box_painting and event.type == 'MOUSEMOVE':
                 self._box_paint_end = mouse_coord
+                return {'RUNNING_MODAL'}
+            if self._is_lasso_painting and event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
+                coords = list(getattr(self, "_lasso_paint_coords", []))
+                coords.append(mouse_coord)
+                face_indices = collect_lasso_face_indices(
+                    context,
+                    obj,
+                    coords,
+                    self._face_centers_world,
+                )
+                changed_count = paint_face_indices(
+                    obj,
+                    self.slot_index,
+                    face_indices,
+                    self._face_slots,
+                    commit_face_slots=False,
+                )
+                self._is_lasso_painting = False
+                self._is_lasso_paint_armed = (self.mode == 'LASSO_PAINT')
+                self._lasso_paint_coords = []
+                if changed_count:
+                    self.report({'INFO'}, f"Lasso painted {changed_count} face(s) with slot {self.slot_index + 1}.")
+                else:
+                    self.report({'INFO'}, "Lasso paint found no visible faces to change.")
                 return {'RUNNING_MODAL'}
             if self._is_box_painting and event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
                 self._box_paint_end = mouse_coord
@@ -7393,6 +7540,7 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
                         settings.selected_lego_palette_slot = picked_slot
                         self.mode = settings.lego_paint_tool_mode
                         self._is_box_paint_armed = (self.mode == 'BOX_PAINT')
+                        self._is_lasso_paint_armed = (self.mode == 'LASSO_PAINT')
                         self._is_picking_color = False
                         self.update_modal_cursor(context, event)
                         self.report({'INFO'}, f"Picked slot {self.slot_index + 1}.")
@@ -7406,12 +7554,16 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
                 self.mode = 'PAINT'
                 self._is_box_paint_armed = False
                 self._is_box_painting = False
+                self._is_lasso_paint_armed = False
+                self._is_lasso_painting = False
                 self._face_centers_world = get_voxel_face_centers_world(obj)
                 settings.lego_paint_tool_mode = 'PAINT'
             else:
                 self.mode = 'ADD'
                 self._is_box_paint_armed = False
                 self._is_box_painting = False
+                self._is_lasso_paint_armed = False
+                self._is_lasso_painting = False
                 self._face_centers_world = []
             self._effective_mode = self.mode
             self._hover_edit = None
@@ -7501,7 +7653,7 @@ class MINIATUREVOXELER_OT_select_paint_slot(Operator):
 
         settings.selected_lego_palette_slot = self.slot_index
         active_tool = MINIATUREVOXELER_OT_voxel_brush_tool._active_tool
-        if active_tool is not None and not getattr(active_tool, "_cancel_requested", False) and active_tool.mode in {'PAINT', 'BOX_PAINT'}:
+        if active_tool is not None and not getattr(active_tool, "_cancel_requested", False) and active_tool.mode in {'PAINT', 'BOX_PAINT', 'LASSO_PAINT'}:
             active_tool.slot_index = self.slot_index
             active_tool._is_editing = False
             active_tool._is_picking_color = False
@@ -9194,6 +9346,11 @@ class MINIATUREVOXELER_PT_panel(Panel):
                 not getattr(active_brush, "_cancel_requested", False) and
                 active_brush.mode == 'BOX_PAINT'
             )
+            is_lasso_active = (
+                active_brush is not None and
+                not getattr(active_brush, "_cancel_requested", False) and
+                active_brush.mode == 'LASSO_PAINT'
+            )
             tool_row = box.row(align=True)
             brush_op = tool_row.operator(
                 "object.miniature_voxeler_voxel_brush_tool",
@@ -9211,6 +9368,13 @@ class MINIATUREVOXELER_PT_panel(Panel):
             )
             rectangle_op.mode = 'BOX_PAINT'
             rectangle_op.slot_index = active_slot
+            lasso_op = tool_row.operator(
+                "object.miniature_voxeler_voxel_brush_tool",
+                text="Lasso",
+                depress=is_lasso_active,
+            )
+            lasso_op.mode = 'LASSO_PAINT'
+            lasso_op.slot_index = active_slot
             try:
                 current_paint_tool_mode = getattr(settings, "lego_paint_tool_mode", 'PAINT')
                 if current_paint_tool_mode == 'PAINT':
