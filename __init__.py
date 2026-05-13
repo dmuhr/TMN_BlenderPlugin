@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Miniature Voxeler",
     "author": "OpenAI",
-    "version": (3, 11, 7),
+    "version": (3, 11, 8),
     "blender": (5, 0, 1),
     "location": "3D View > Sidebar > Miniature Voxeler",
     "description": "Block remesh, transfer texture, create Lego-color face materials, and generate Lego skin meshes for miniature voxel workflows",
@@ -31,7 +31,7 @@ from bpy.props import (
     EnumProperty,
 )
 
-ADDON_VERSION_TEXT = "v.3.11.7"
+ADDON_VERSION_TEXT = "v.3.11.8"
 
 
 def srgb_channel_to_linear(value):
@@ -2331,6 +2331,22 @@ def set_active_object(context, obj):
     bpy.ops.object.select_all(action='DESELECT')
     obj.select_set(True)
     context.view_layer.objects.active = obj
+
+
+def apply_object_transform_to_mesh(obj):
+    if obj is None or obj.type != 'MESH':
+        return False
+
+    if obj.data.users > 1:
+        obj.data = obj.data.copy()
+
+    transform = obj.matrix_basis.copy()
+    obj.data.transform(transform)
+    obj.data.update()
+    identity = transform.copy()
+    identity.identity()
+    obj.matrix_basis = identity
+    return True
 
 
 def get_root_name(obj_name):
@@ -5590,9 +5606,15 @@ class MINIATUREVOXELER_OT_apply_all_transforms(Operator):
         context.scene.unit_settings.system = 'METRIC'
         context.scene.unit_settings.length_unit = 'MILLIMETERS'
 
+        applied_names = []
         for obj in (building_obj, platform_obj):
-            set_active_object(context, obj)
-            bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+            if apply_object_transform_to_mesh(obj):
+                applied_names.append(obj.name)
+
+        if len(applied_names) != 2:
+            settings.source_validation_key = ""
+            self.report({'ERROR'}, "Could not apply transforms to both source meshes.")
+            return {'CANCELLED'}
 
         warnings = get_source_scale_warnings(context, building_obj, platform_obj)
         if warnings:
