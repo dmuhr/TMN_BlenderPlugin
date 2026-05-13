@@ -7197,17 +7197,6 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
         previous = type(self)._active_tool
         if previous is not None and previous is not self and not getattr(previous, "_cancel_requested", False):
             if previous.mode == self.mode and previous.slot_index == self.slot_index:
-                if self.mode in {'BOX_PAINT', 'LASSO_PAINT'}:
-                    previous._is_box_paint_armed = (self.mode == 'BOX_PAINT')
-                    previous._is_box_painting = False
-                    previous._is_lasso_paint_armed = (self.mode == 'LASSO_PAINT')
-                    previous._is_lasso_painting = False
-                    previous._box_paint_start = None
-                    previous._box_paint_end = None
-                    previous._lasso_paint_coords = []
-                    tool_label = "Rectangle" if self.mode == 'BOX_PAINT' else "Lasso"
-                    self.report({'INFO'}, f"{tool_label} paint ready for slot {self.slot_index + 1}.")
-                    return {'FINISHED'}
                 previous._cancel_requested = True
                 previous._cancel_message = "Voxel brush finished."
                 return {'FINISHED'}
@@ -9371,6 +9360,7 @@ class MINIATUREVOXELER_PT_panel(Panel):
             lasso_op = tool_row.operator(
                 "object.miniature_voxeler_voxel_brush_tool",
                 text="Lasso",
+                icon='SELECT_INTERSECT',
                 depress=is_lasso_active,
             )
             lasso_op.mode = 'LASSO_PAINT'
