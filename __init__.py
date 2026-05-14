@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Miniature Voxeler",
     "author": "Diego Muhr",
-    "version": (4, 0, 1),
+    "version": (4, 0, 3),
     "blender": (5, 0, 1),
     "location": "3D View > Sidebar > Miniature Voxeler",
     "description": "Block remesh, transfer texture, create Lego-color face materials, and generate Lego skin meshes for miniature voxel workflows",
@@ -20,6 +20,7 @@ from math import atan2, cos, floor, hypot, pi, radians, sin
 from time import perf_counter
 from bpy_extras import view3d_utils
 from mathutils import Vector, geometry
+from mathutils.bvhtree import BVHTree
 from bpy.types import Operator, Panel, PropertyGroup
 from bpy.props import (
     IntProperty,
@@ -31,7 +32,7 @@ from bpy.props import (
     EnumProperty,
 )
 
-ADDON_VERSION_TEXT = "v.4.0.1"
+ADDON_VERSION_TEXT = "v.4.0.3"
 
 
 def srgb_channel_to_linear(value):
@@ -2178,6 +2179,13 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
         default="",
     )
 
+    texture_source_filepath: StringProperty(
+        name="Texture File",
+        description="Optional image file to use on the texture source before baking",
+        default="",
+        subtype='FILE_PATH',
+    )
+
     texture_size: IntProperty(
         name="Texture Size",
         description="Resolution of the baked texture",
@@ -2192,6 +2200,48 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
         default=16,
         min=0,
         max=128,
+    )
+
+    texture_bake_type: EnumProperty(
+        name="Bake Mode",
+        description="How Blender reads color from the source during texture transfer",
+        items=[
+            ('DIFFUSE', "Diffuse Color", "Bake the source material base color without direct or indirect lighting"),
+            ('EMIT', "Emission", "Bake emission color; useful with Texture File when diffuse baking picks up unwanted shading"),
+        ],
+        default='DIFFUSE',
+    )
+
+    texture_projection_distance: FloatProperty(
+        name="Max Ray Distance",
+        description="Maximum selected-to-active projection distance in scene units. Use 0 for Blender's default",
+        default=0.0,
+        min=0.0,
+        soft_max=1.0,
+        precision=4,
+    )
+
+    texture_cage_extrusion: FloatProperty(
+        name="Cage Extrusion",
+        description="Inflates the target cage for selected-to-active baking so voxel faces can reach the source mesh",
+        default=0.0,
+        min=0.0,
+        soft_max=0.25,
+        precision=4,
+    )
+
+    texture_bake_samples: IntProperty(
+        name="Bake Samples",
+        description="Cycles sample count used for the texture transfer bake",
+        default=16,
+        min=1,
+        max=512,
+    )
+
+    texture_clear_image: BoolProperty(
+        name="Clear Image",
+        description="Clear the target bake image before transfer. Disable to keep the previous bake where projection rays miss",
+        default=True,
     )
 
     lego_color_sample_mode: EnumProperty(
@@ -5495,6 +5545,64 @@ def ensure_bake_material(target_obj, image):
     return mat, node_tex
 
 
+def load_texture_source_image(filepath):
+    if not filepath:
+        return None
+
+    absolute_path = bpy.path.abspath(filepath)
+    if not os.path.isfile(absolute_path):
+        raise FileNotFoundError(f"Texture file was not found: {absolute_path}")
+
+    for image in bpy.data.images:
+        if image.filepath and os.path.abspath(bpy.path.abspath(image.filepath)) == os.path.abspath(absolute_path):
+            if not image.has_data:
+                image.reload()
+            return image
+
+    return bpy.data.images.load(absolute_path, check_existing=True)
+
+
+def ensure_texture_source_file_material(source_obj, image, bake_type='DIFFUSE'):
+    mat_name = f"{source_obj.name}_TextureFile_Source"
+    mat = bpy.data.materials.get(mat_name)
+    if mat is None:
+        mat = bpy.data.materials.new(mat_name)
+
+    mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    nodes.clear()
+
+    node_output = nodes.new("ShaderNodeOutputMaterial")
+    node_output.location = (400, 0)
+
+    node_tex = nodes.new("ShaderNodeTexImage")
+    node_tex.location = (-200, 0)
+    node_tex.image = image
+
+    if bake_type == 'EMIT':
+        node_emit = nodes.new("ShaderNodeEmission")
+        node_emit.location = (120, 0)
+        links.new(node_tex.outputs["Color"], node_emit.inputs["Color"])
+        links.new(node_emit.outputs["Emission"], node_output.inputs["Surface"])
+    else:
+        node_bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+        node_bsdf.location = (120, 0)
+        links.new(node_tex.outputs["Color"], node_bsdf.inputs["Base Color"])
+        links.new(node_bsdf.outputs["BSDF"], node_output.inputs["Surface"])
+    nodes.active = node_tex
+
+    if source_obj.data.materials:
+        source_obj.data.materials[0] = mat
+    else:
+        source_obj.data.materials.append(mat)
+
+    for poly in source_obj.data.polygons:
+        poly.material_index = 0
+
+    return mat
+
+
 def ensure_bake_image(target_obj, size):
     img_name = f"{target_obj.name}_Color"
     img = bpy.data.images.get(img_name)
@@ -5639,6 +5747,117 @@ def get_polygon_texture_color(poly, uv_data, image, pixels, sample_mode):
         return median_color(samples)
 
     return average_color(samples)
+
+
+def get_polygon_texture_color_at_world_location(obj, mesh, poly, uv_data, image, pixels, world_location):
+    if not poly.loop_indices:
+        return (0.0, 0.0, 0.0)
+
+    loop_indices = list(poly.loop_indices)
+    if len(loop_indices) < 3:
+        return get_polygon_texture_color(poly, uv_data, image, pixels, 'CENTER')
+
+    matrix = obj.matrix_world
+    best = None
+    first_loop = loop_indices[0]
+    triangle_loop_sets = []
+    for index in range(1, len(loop_indices) - 1):
+        triangle_loop_sets.append((first_loop, loop_indices[index], loop_indices[index + 1]))
+
+    for loop_a, loop_b, loop_c in triangle_loop_sets:
+        vert_a = matrix @ mesh.vertices[mesh.loops[loop_a].vertex_index].co
+        vert_b = matrix @ mesh.vertices[mesh.loops[loop_b].vertex_index].co
+        vert_c = matrix @ mesh.vertices[mesh.loops[loop_c].vertex_index].co
+        closest = geometry.closest_point_on_tri(world_location, vert_a, vert_b, vert_c)
+        distance_sq = (closest - world_location).length_squared
+        if best is None or distance_sq < best[0]:
+            best = (distance_sq, closest, loop_a, loop_b, loop_c, vert_a, vert_b, vert_c)
+
+    if best is None:
+        return get_polygon_texture_color(poly, uv_data, image, pixels, 'CENTER')
+
+    _distance_sq, closest, loop_a, loop_b, loop_c, vert_a, vert_b, vert_c = best
+    uv_a = uv_data[loop_a].uv
+    uv_b = uv_data[loop_b].uv
+    uv_c = uv_data[loop_c].uv
+    uv = geometry.barycentric_transform(
+        closest,
+        vert_a,
+        vert_b,
+        vert_c,
+        Vector((uv_a.x, uv_a.y, 0.0)),
+        Vector((uv_b.x, uv_b.y, 0.0)),
+        Vector((uv_c.x, uv_c.y, 0.0)),
+    )
+    return sample_image_color(image, pixels, image.size[0], image.size[1], uv.x, uv.y)
+
+
+def get_source_polygon_color(obj, mesh, poly, image=None, pixels=None, sample_mode='CENTER', world_location=None):
+    uv_data = mesh.uv_layers.active.data if mesh.uv_layers.active else None
+    if image is not None and pixels is not None and uv_data is not None:
+        if world_location is not None:
+            return get_polygon_texture_color_at_world_location(obj, mesh, poly, uv_data, image, pixels, world_location)
+        return get_polygon_texture_color(poly, uv_data, image, pixels, sample_mode)
+
+    if 0 <= poly.material_index < len(obj.data.materials):
+        return get_material_base_color(obj.data.materials[poly.material_index])
+
+    return (0.8, 0.8, 0.8)
+
+
+def build_world_bvh_from_mesh(obj, mesh):
+    vertices = [obj.matrix_world @ vertex.co for vertex in mesh.vertices]
+    polygons = [list(poly.vertices) for poly in mesh.polygons]
+    if not vertices or not polygons:
+        return None
+    return BVHTree.FromPolygons(vertices, polygons)
+
+
+def collect_direct_source_face_colors(context, source_obj, target_obj, settings):
+    depsgraph = context.evaluated_depsgraph_get()
+    source_eval = source_obj.evaluated_get(depsgraph)
+    source_mesh = source_eval.to_mesh()
+    try:
+        if not source_mesh.polygons:
+            return []
+
+        bvh = build_world_bvh_from_mesh(source_eval, source_mesh)
+        if bvh is None:
+            return []
+
+        image = get_object_color_image(source_obj)
+        pixels = None
+        if image is not None:
+            if not image.has_data:
+                try:
+                    image.reload()
+                except Exception:
+                    pass
+            if image.size[0] > 0 and image.size[1] > 0:
+                pixels = list(image.pixels[:])
+
+        target_mesh = target_obj.data
+        target_matrix = target_obj.matrix_world
+        face_colors = []
+        for poly in target_mesh.polygons:
+            center = target_matrix @ get_polygon_center(target_mesh, poly)
+            _location, _normal, source_face_index, _distance = bvh.find_nearest(center)
+            if source_face_index is None or source_face_index < 0 or source_face_index >= len(source_mesh.polygons):
+                face_colors.append((0.8, 0.8, 0.8))
+                continue
+            source_poly = source_mesh.polygons[source_face_index]
+            face_colors.append(get_source_polygon_color(
+                source_eval,
+                source_mesh,
+                source_poly,
+                image=image,
+                pixels=pixels,
+                sample_mode=settings.lego_color_sample_mode,
+                world_location=_location,
+            ))
+        return face_colors
+    finally:
+        source_eval.to_mesh_clear()
 
 
 def build_adaptive_palette(face_colors, color_count):
@@ -6132,27 +6351,58 @@ class MINIATUREVOXELER_OT_transfer_texture(Operator):
             self.report({'ERROR'}, "Source object is not a mesh.")
             return {'CANCELLED'}
 
+        source_texture_path = settings.texture_source_filepath.strip()
+        if source_texture_path:
+            try:
+                source_image = load_texture_source_image(source_texture_path)
+                ensure_texture_source_file_material(source_obj, source_image, settings.texture_bake_type)
+            except Exception as e:
+                self.report({'ERROR'}, f"Could not load texture file: {str(e)}")
+                return {'CANCELLED'}
+
         image = ensure_bake_image(target_obj, settings.texture_size)
         _, image_node = ensure_bake_material(target_obj, image)
 
         scene = context.scene
         old_engine = scene.render.engine
+        old_cycles_samples = getattr(getattr(scene, "cycles", None), "samples", None)
         source_was_hidden = source_obj.hide_get()
         target_was_hidden = target_obj.hide_get()
         building_was_hidden = building_obj.hide_get() if building_obj is not None else None
+        bake = scene.render.bake
+        old_bake_values = {}
+        for attr_name in (
+            "use_selected_to_active",
+            "margin",
+            "use_pass_direct",
+            "use_pass_indirect",
+            "use_pass_color",
+            "max_ray_distance",
+            "cage_extrusion",
+            "use_clear",
+        ):
+            if hasattr(bake, attr_name):
+                old_bake_values[attr_name] = getattr(bake, attr_name)
 
         try:
             scene.render.engine = 'CYCLES'
+            if getattr(scene, "cycles", None) is not None and hasattr(scene.cycles, "samples"):
+                scene.cycles.samples = settings.texture_bake_samples
             source_obj.hide_set(False)
             target_obj.hide_set(False)
             if building_obj is not None and building_obj != source_obj:
                 building_obj.hide_set(True)
 
-            bake = scene.render.bake
             if hasattr(bake, "use_selected_to_active"):
                 bake.use_selected_to_active = True
             if hasattr(bake, "margin"):
                 bake.margin = settings.texture_margin
+            if hasattr(bake, "max_ray_distance"):
+                bake.max_ray_distance = settings.texture_projection_distance
+            if hasattr(bake, "cage_extrusion"):
+                bake.cage_extrusion = settings.texture_cage_extrusion
+            if hasattr(bake, "use_clear"):
+                bake.use_clear = settings.texture_clear_image
             if hasattr(bake, "use_pass_direct"):
                 bake.use_pass_direct = False
             if hasattr(bake, "use_pass_indirect"):
@@ -6168,7 +6418,7 @@ class MINIATUREVOXELER_OT_transfer_texture(Operator):
             if target_obj.active_material and target_obj.active_material.use_nodes:
                 target_obj.active_material.node_tree.nodes.active = image_node
 
-            bpy.ops.object.bake(type='DIFFUSE')
+            bpy.ops.object.bake(type=settings.texture_bake_type)
 
             try:
                 image.pack()
@@ -6179,19 +6429,99 @@ class MINIATUREVOXELER_OT_transfer_texture(Operator):
             source_obj.hide_set(source_was_hidden)
             target_obj.hide_set(target_was_hidden)
             if building_obj is not None and building_was_hidden is not None:
-                building_obj.hide_set(building_was_hidden or True)
+                building_obj.hide_set(building_was_hidden)
             scene.render.engine = old_engine
+            if old_cycles_samples is not None and getattr(scene, "cycles", None) is not None:
+                scene.cycles.samples = old_cycles_samples
+            for attr_name, old_value in old_bake_values.items():
+                setattr(bake, attr_name, old_value)
             self.report({'ERROR'}, f"Texture transfer failed: {str(e)}")
             return {'CANCELLED'}
 
         scene.render.engine = old_engine
+        if old_cycles_samples is not None and getattr(scene, "cycles", None) is not None:
+            scene.cycles.samples = old_cycles_samples
+        for attr_name, old_value in old_bake_values.items():
+            setattr(bake, attr_name, old_value)
         source_obj.hide_set(source_was_hidden)
         target_obj.hide_set(target_was_hidden)
         if building_obj is not None and building_was_hidden is not None:
-            building_obj.hide_set(building_was_hidden or True)
+            building_obj.hide_set(building_was_hidden)
         set_active_object(context, target_obj)
 
-        self.report({'INFO'}, f"Texture baked from {source_obj.name} to {target_obj.name}")
+        source_label = os.path.basename(bpy.path.abspath(source_texture_path)) if source_texture_path else source_obj.name
+        self.report({'INFO'}, f"Texture baked from {source_label} via {source_obj.name} to {target_obj.name}")
+        return {'FINISHED'}
+
+
+class MINIATUREVOXELER_OT_direct_source_colors(Operator):
+    bl_idname = "object.miniature_voxeler_direct_source_colors"
+    bl_label = "Direct Source Colors"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return has_blocks_object(context) and has_building_object(context)
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        target_obj = get_blocks_object(settings)
+        building_obj = get_building_object(settings)
+        if target_obj is None:
+            self.report({'ERROR'}, "Run Step 2 Block Remesh first so the _Blocks object exists.")
+            return {'CANCELLED'}
+
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        source_obj = get_texture_source_object(settings)
+        if source_obj is None and not settings.texture_source_name.strip():
+            source_obj = ensure_building_body_object(context, settings)
+
+        if source_obj is None:
+            self.report({'ERROR'}, "No _body source found. Run Voxelize Building again, or enter a valid Source Override.")
+            return {'CANCELLED'}
+
+        if building_obj is not None and source_obj == building_obj:
+            self.report({'ERROR'}, "Direct Source Colors must use the _body copy, not the original Building.")
+            return {'CANCELLED'}
+
+        if source_obj == target_obj:
+            self.report({'ERROR'}, "Source object and target object are the same.")
+            return {'CANCELLED'}
+
+        if source_obj.type != 'MESH':
+            self.report({'ERROR'}, "Source object is not a mesh.")
+            return {'CANCELLED'}
+
+        source_texture_path = settings.texture_source_filepath.strip()
+        if source_texture_path:
+            try:
+                source_image = load_texture_source_image(source_texture_path)
+                ensure_texture_source_file_material(source_obj, source_image, settings.texture_bake_type)
+            except Exception as e:
+                self.report({'ERROR'}, f"Could not load texture file: {str(e)}")
+                return {'CANCELLED'}
+
+        face_colors = collect_direct_source_face_colors(context, source_obj, target_obj, settings)
+        if not face_colors:
+            self.report({'ERROR'}, "Could not sample colors from the source surface.")
+            return {'CANCELLED'}
+
+        if settings.lego_color_assign_mode == 'LUMINANCE':
+            palette, assignments = build_luminance_palette(face_colors, settings.lego_color_count)
+        else:
+            palette, assignments = build_adaptive_palette(face_colors, settings.lego_color_count)
+
+        sync_slot_palette_properties(settings, palette)
+        rebuild_materials_from_assignments(target_obj, settings, assignments, len(palette))
+        sync_voxel_color_state_from_mesh(target_obj)
+        settings.platform_foot_color_slot = '0'
+        apply_platform_foot_color_slot(settings)
+        set_active_object(context, target_obj)
+
+        source_label = os.path.basename(bpy.path.abspath(source_texture_path)) if source_texture_path else source_obj.name
+        self.report({'INFO'}, f"Direct Source Colors sampled {len(face_colors)} face(s) from {source_label}.")
         return {'FINISHED'}
 
 
@@ -9367,9 +9697,16 @@ class MINIATUREVOXELER_PT_panel(Panel):
             box.operator("object.miniature_voxeler_smart_uv_project", text="Generate UVs", icon='UV')
             texture_col = box.column(align=True)
             texture_col.prop(settings, "texture_source_name")
+            texture_col.prop(settings, "texture_source_filepath")
             texture_col.prop(settings, "texture_size")
             texture_col.prop(settings, "texture_margin")
+            texture_col.prop(settings, "texture_bake_type")
+            texture_col.prop(settings, "texture_projection_distance")
+            texture_col.prop(settings, "texture_cage_extrusion")
+            texture_col.prop(settings, "texture_bake_samples")
+            texture_col.prop(settings, "texture_clear_image")
             box.operator("object.miniature_voxeler_transfer_texture", text="Transfer Texture", icon='TEXTURE')
+            box.operator("object.miniature_voxeler_direct_source_colors", text="Direct Source Colors", icon='MATERIAL')
             color_col = box.column(align=True)
             color_col.prop(settings, "lego_color_count")
             color_col.prop(settings, "lego_color_sample_mode")
@@ -9552,6 +9889,7 @@ classes = (
     MINIATUREVOXELER_OT_block_remesh,
     MINIATUREVOXELER_OT_smart_uv_project,
     MINIATUREVOXELER_OT_transfer_texture,
+    MINIATUREVOXELER_OT_direct_source_colors,
     MINIATUREVOXELER_OT_lego_color,
     MINIATUREVOXELER_OT_delete_lego_color_slots,
     MINIATUREVOXELER_OT_smooth_lego_color,
