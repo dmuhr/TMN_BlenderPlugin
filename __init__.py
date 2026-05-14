@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Miniature Voxeler",
     "author": "Diego Muhr",
-    "version": (4, 0, 0),
+    "version": (4, 0, 1),
     "blender": (5, 0, 1),
     "location": "3D View > Sidebar > Miniature Voxeler",
     "description": "Block remesh, transfer texture, create Lego-color face materials, and generate Lego skin meshes for miniature voxel workflows",
@@ -31,7 +31,7 @@ from bpy.props import (
     EnumProperty,
 )
 
-ADDON_VERSION_TEXT = "v.3.11.8"
+ADDON_VERSION_TEXT = "v.4.0.1"
 
 
 def srgb_channel_to_linear(value):
@@ -795,20 +795,28 @@ def draw_voxel_transparent_cells(obj, coords, color):
     gpu.state.blend_set('NONE')
 
 
-def paint_faces_with_brush(context, event, obj, slot_index, brush_size, face_slots=None, commit_face_slots=True, face_centers_world=None):
+def paint_faces_with_brush(context, event, obj, slot_index, brush_size, face_slots=None, commit_face_slots=True, face_centers_world=None, undo_batch=None):
     face_indices = collect_brush_face_indices(context, event, obj, brush_size, face_centers_world)
     if not face_indices:
         return 0
 
-    return paint_face_indices(obj, slot_index, face_indices, face_slots, commit_face_slots)
+    return paint_face_indices(obj, slot_index, face_indices, face_slots, commit_face_slots, undo_batch)
 
 
-def paint_face_indices(obj, slot_index, face_indices, face_slots=None, commit_face_slots=True):
+def paint_face_indices(obj, slot_index, face_indices, face_slots=None, commit_face_slots=True, undo_batch=None):
     mesh = obj.data
     changed_count = 0
 
     for paint_face_index in face_indices:
+        previous_slot = int(mesh.polygons[paint_face_index].material_index)
         if mesh.polygons[paint_face_index].material_index != slot_index:
+            if undo_batch is not None:
+                undo_batch.append({
+                    "face_index": int(paint_face_index),
+                    "face_key": get_voxel_face_key_from_mesh(mesh, paint_face_index),
+                    "previous_slot": previous_slot,
+                    "new_slot": int(slot_index),
+                })
             mesh.polygons[paint_face_index].material_index = slot_index
             changed_count += 1
         if face_slots is not None:
@@ -7045,6 +7053,60 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
             return 1
         return 1
 
+    def push_paint_undo_batch(self, batch):
+        if not batch:
+            return 0
+        undo_stack = getattr(self, "_paint_undo_stack", None)
+        if undo_stack is None:
+            self._paint_undo_stack = []
+            undo_stack = self._paint_undo_stack
+        undo_stack.append(batch)
+        if len(undo_stack) > 100:
+            undo_stack.pop(0)
+        return 1
+
+    def finish_active_paint_stroke(self):
+        batch = getattr(self, "_active_paint_undo_batch", None)
+        if batch:
+            self.push_paint_undo_batch(batch)
+        self._active_paint_undo_batch = []
+
+    def undo_last_paint_edit(self, context, obj=None):
+        undo_stack = getattr(self, "_paint_undo_stack", [])
+        if not undo_stack:
+            self.report({'INFO'}, "No voxel paint strokes to undo.")
+            return 0
+
+        settings = context.scene.miniature_voxeler_settings
+        obj = obj or get_blocks_object(settings)
+        if obj is None or obj.type != 'MESH':
+            return 0
+
+        mesh = obj.data
+        face_slots = getattr(self, "_face_slots", None)
+        batch = undo_stack.pop()
+        for item in reversed(batch):
+            face_index = int(item.get("face_index", -1))
+            previous_slot = int(item.get("previous_slot", 0))
+            if 0 <= face_index < len(mesh.polygons):
+                mesh.polygons[face_index].material_index = previous_slot
+            face_key = item.get("face_key")
+            if face_slots is not None and face_key is not None and face_key[3] >= 0:
+                face_slots[tuple(face_key)] = previous_slot
+
+        if face_slots is not None:
+            store_voxel_face_slots(obj, face_slots)
+            self._cells = sync_voxel_cell_slots_from_face_slots(self._cells, face_slots)
+            origin = get_stored_voxel_origin(obj)
+            voxel_size = float(obj.get("mv_voxel_size", 0.0))
+            if origin is not None and voxel_size > 0.0:
+                store_voxel_state(obj, origin, voxel_size, self._cells)
+        mesh.update()
+        if context.area:
+            context.area.tag_redraw()
+        self.report({'INFO'}, "Undid last voxel paint stroke.")
+        return 1
+
     def maybe_flush_visible_voxel_rebuild(self, context, obj):
         if not getattr(self, "_pending_rebuild", False):
             return 0
@@ -7056,6 +7118,7 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
     def finish_modal(self, context, message=None):
         obj = get_blocks_object(context.scene.miniature_voxeler_settings)
         self.flush_pending_voxel_rebuild(context, obj)
+        self.finish_active_paint_stroke()
         if obj is not None and getattr(self, "_face_slots", None) is not None:
             store_voxel_face_slots(obj, self._face_slots)
             self._cells = sync_voxel_cell_slots_from_face_slots(self._cells, self._face_slots)
@@ -7202,6 +7265,7 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
                 return {'FINISHED'}
             if self.mode in {'PAINT', 'BOX_PAINT', 'LASSO_PAINT'}:
                 previous.flush_pending_voxel_rebuild(context, obj)
+                previous.finish_active_paint_stroke()
             previous.mode = self.mode
             previous.slot_index = self.slot_index
             previous._is_editing = False
@@ -7214,6 +7278,7 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
             previous._box_paint_start = None
             previous._box_paint_end = None
             previous._lasso_paint_coords = []
+            previous._active_paint_undo_batch = []
             previous._hover_edit = None
             if self.mode not in {'PAINT', 'BOX_PAINT', 'LASSO_PAINT'}:
                 previous._face_centers_world = []
@@ -7246,6 +7311,8 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
         self._pending_removed = set()
         self._voxel_preview_undo_stack = []
         self._voxel_apply_undo_stack = []
+        self._paint_undo_stack = []
+        self._active_paint_undo_batch = []
         self._last_applied_target = None
         self._drag_face_dir = None
         self._drag_plane_coord = None
@@ -7375,6 +7442,15 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
                 return {'RUNNING_MODAL'}
             return {'RUNNING_MODAL'}
 
+        if event.type == 'Z' and event.value == 'PRESS' and getattr(event, "ctrl", False):
+            self._is_editing = False
+            if self.mode in {'PAINT', 'BOX_PAINT', 'LASSO_PAINT'}:
+                self.finish_active_paint_stroke()
+                self.undo_last_paint_edit(context, obj)
+            elif self._effective_mode in {'ADD', 'REMOVE'}:
+                self.undo_last_voxel_edit(context, obj)
+            return {'RUNNING_MODAL'}
+
         if (
             getattr(self, "_is_box_paint_armed", False) or
             getattr(self, "_is_box_painting", False) or
@@ -7443,13 +7519,16 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
                     coords,
                     self._face_centers_world,
                 )
+                undo_batch = []
                 changed_count = paint_face_indices(
                     obj,
                     self.slot_index,
                     face_indices,
                     self._face_slots,
                     commit_face_slots=False,
+                    undo_batch=undo_batch,
                 )
+                self.push_paint_undo_batch(undo_batch)
                 self._is_lasso_painting = False
                 self._is_lasso_paint_armed = (self.mode == 'LASSO_PAINT')
                 self._lasso_paint_coords = []
@@ -7467,13 +7546,16 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
                     self._box_paint_end,
                     self._face_centers_world,
                 )
+                undo_batch = []
                 changed_count = paint_face_indices(
                     obj,
                     self.slot_index,
                     face_indices,
                     self._face_slots,
                     commit_face_slots=False,
+                    undo_batch=undo_batch,
                 )
+                self.push_paint_undo_batch(undo_batch)
                 self._is_box_painting = False
                 self._is_box_paint_armed = (self.mode == 'BOX_PAINT')
                 self._box_paint_start = None
@@ -7484,11 +7566,6 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
                     self.report({'INFO'}, "Box paint found no visible faces to change.")
                 return {'RUNNING_MODAL'}
             return {'PASS_THROUGH'}
-
-        if event.type == 'Z' and event.value == 'PRESS' and getattr(event, "ctrl", False) and self._effective_mode in {'ADD', 'REMOVE'}:
-            self._is_editing = False
-            self.undo_last_voxel_edit(context, obj)
-            return {'RUNNING_MODAL'}
 
         if event.type == 'SPACE' and event.value == 'PRESS' and self._effective_mode in {'ADD', 'REMOVE'}:
             self._is_editing = False
@@ -7565,6 +7642,7 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
             if event.value == 'PRESS':
                 if self._effective_mode == 'PAINT':
                     self.flush_pending_voxel_rebuild(context, obj)
+                    self._active_paint_undo_batch = []
                 elif self._effective_mode == 'ADD' and self._hover_edit is not None:
                     self._drag_face_dir = self._hover_edit.get("face_dir")
                     self._drag_plane_coord = self._hover_edit["target"][get_axis_for_face_dir(self._drag_face_dir)]
@@ -7578,6 +7656,7 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
                 self._is_editing = False
                 if self._effective_mode == 'PAINT':
                     self.flush_pending_voxel_rebuild(context, obj)
+                    self.finish_active_paint_stroke()
                 self._drag_face_dir = None
                 self._drag_plane_coord = None
                 self._drag_effective_mode = None
@@ -7595,6 +7674,7 @@ class MINIATUREVOXELER_OT_voxel_brush_tool(Operator):
                     self._face_slots,
                     commit_face_slots=False,
                     face_centers_world=self._face_centers_world,
+                    undo_batch=self._active_paint_undo_batch,
                 )
                 if changed:
                     return {'RUNNING_MODAL'}
