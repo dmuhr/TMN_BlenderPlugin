@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Miniature Voxeler",
     "author": "Diego Muhr",
-    "version": (4, 0, 3),
+    "version": (4, 0, 4),
     "blender": (5, 0, 1),
     "location": "3D View > Sidebar > Miniature Voxeler",
     "description": "Block remesh, transfer texture, create Lego-color face materials, and generate Lego skin meshes for miniature voxel workflows",
@@ -32,7 +32,7 @@ from bpy.props import (
     EnumProperty,
 )
 
-ADDON_VERSION_TEXT = "v.4.0.3"
+ADDON_VERSION_TEXT = "v.4.0.4"
 
 
 def srgb_channel_to_linear(value):
@@ -1156,6 +1156,53 @@ def fill_vertical_voxel_columns(cells, fill_slot=0):
     return filled_count
 
 
+def fill_enclosed_xy_voxel_slice_holes(cells, fill_slot=0):
+    if not cells:
+        return 0
+
+    cells_by_z = {}
+    for i, j, k in cells.keys():
+        cells_by_z.setdefault(k, set()).add((i, j))
+
+    xy_neighbors = (
+        (1, 0),
+        (-1, 0),
+        (0, 1),
+        (0, -1),
+    )
+    filled_count = 0
+
+    for k, occupied in cells_by_z.items():
+        min_i = min(coord[0] for coord in occupied) - 1
+        max_i = max(coord[0] for coord in occupied) + 1
+        min_j = min(coord[1] for coord in occupied) - 1
+        max_j = max(coord[1] for coord in occupied) + 1
+
+        outside = {(min_i, min_j)}
+        queue = deque([(min_i, min_j)])
+        while queue:
+            i, j = queue.popleft()
+            for di, dj in xy_neighbors:
+                neighbor = (i + di, j + dj)
+                if neighbor in outside or neighbor in occupied:
+                    continue
+                if min_i <= neighbor[0] <= max_i and min_j <= neighbor[1] <= max_j:
+                    outside.add(neighbor)
+                    queue.append(neighbor)
+
+        for i in range(min_i + 1, max_i):
+            for j in range(min_j + 1, max_j):
+                if (i, j) in occupied or (i, j) in outside:
+                    continue
+                coord = (i, j, k)
+                if coord in cells:
+                    continue
+                cells[coord] = int(fill_slot)
+                filled_count += 1
+
+    return filled_count
+
+
 def clamp_voxel_index(value, limit):
     return max(0, min(int(value), int(limit) - 1))
 
@@ -1522,10 +1569,12 @@ def generate_voxel_cells_from_object(context, source_obj, settings):
     surface_cell_count = mark_surface_voxel_cells_from_object(source_eval, origin, voxel_size, counts, cells)
     cavity_fill_count = fill_enclosed_voxel_cavities(cells, counts)
     vertical_fill_count = fill_vertical_voxel_columns(cells)
+    xy_slice_fill_count = fill_enclosed_xy_voxel_slice_holes(cells)
     stats = {
         "surface_cell_count": surface_cell_count,
         "cavity_fill_count": cavity_fill_count,
         "vertical_fill_count": vertical_fill_count,
+        "xy_slice_fill_count": xy_slice_fill_count,
     }
     return origin, voxel_size, cells, stats
 
@@ -6260,12 +6309,13 @@ class MINIATUREVOXELER_OT_block_remesh(Operator):
         new_obj["mv_surface_cell_count"] = int(voxel_stats.get("surface_cell_count", 0))
         new_obj["mv_cavity_fill_cell_count"] = int(voxel_stats.get("cavity_fill_count", 0))
         new_obj["mv_vertical_fill_cell_count"] = int(voxel_stats.get("vertical_fill_count", 0))
+        new_obj["mv_xy_slice_fill_cell_count"] = int(voxel_stats.get("xy_slice_fill_count", 0))
         source_obj.hide_set(True)
         if building_obj is not None:
             building_obj.hide_set(True)
         set_active_object(context, new_obj)
         voxel_size_mm = voxel_size * context.scene.unit_settings.scale_length * 1000.0
-        self.report({'INFO'}, f"Created voxel object: {new_obj.name} from {source_obj.name} | {len(cells)} cubes | surface {voxel_stats.get('surface_cell_count', 0)} + cavity {voxel_stats.get('cavity_fill_count', 0)} + vertical {voxel_stats.get('vertical_fill_count', 0)} | {voxel_size_mm:.3f} mm")
+        self.report({'INFO'}, f"Created voxel object: {new_obj.name} from {source_obj.name} | {len(cells)} cubes | surface {voxel_stats.get('surface_cell_count', 0)} + cavity {voxel_stats.get('cavity_fill_count', 0)} + vertical {voxel_stats.get('vertical_fill_count', 0)} + XY solid {voxel_stats.get('xy_slice_fill_count', 0)} | {voxel_size_mm:.3f} mm")
         return {'FINISHED'}
 
 
