@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Miniature Voxeler",
     "author": "Diego Muhr",
-    "version": (4, 0, 4),
+    "version": (5, 0, 8),
     "blender": (5, 0, 1),
     "location": "3D View > Sidebar > Miniature Voxeler",
     "description": "Block remesh, transfer texture, create Lego-color face materials, and generate Lego skin meshes for miniature voxel workflows",
@@ -32,7 +32,9 @@ from bpy.props import (
     EnumProperty,
 )
 
-ADDON_VERSION_TEXT = "v.4.0.4"
+ADDON_VERSION_TEXT = "v.5.0.8"
+VOXEL_MESH_FORMAT_VERSION = 405
+VOXEL_MESH_FORMAT_VERSION_KEY = "mv_voxel_mesh_format_version"
 
 
 def srgb_channel_to_linear(value):
@@ -310,14 +312,20 @@ def has_source_objects(context):
 
 def get_blocks_object(settings):
     building_obj = get_building_object(settings)
-    if building_obj is None:
-        return None
+    if building_obj is not None:
+        blocks_name = get_blocks_name(get_root_name(building_obj.name))
+        blocks_obj = bpy.data.objects.get(blocks_name)
+        if blocks_obj is not None and blocks_obj.type == 'MESH':
+            return blocks_obj
 
-    blocks_name = get_blocks_name(get_root_name(building_obj.name))
-    blocks_obj = bpy.data.objects.get(blocks_name)
-    if blocks_obj is None or blocks_obj.type != 'MESH':
-        return None
-    return blocks_obj
+    candidates = [
+        obj
+        for obj in bpy.data.objects
+        if obj.type == 'MESH' and obj.name.endswith("_Blocks") and obj.get("mv_voxel_cells_json", "")
+    ]
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
 
 
 def has_blocks_object(context):
@@ -685,6 +693,34 @@ def sync_voxel_color_state_from_mesh(obj):
     if origin is not None and voxel_size > 0.0:
         store_voxel_state(obj, origin, voxel_size, cells)
     return face_slots
+
+
+def assign_bottom_voxel_faces_to_slot(obj, slot_index):
+    if obj is None or obj.type != 'MESH' or not obj.data.polygons:
+        return 0
+
+    mesh = obj.data
+    slot_index = max(0, min(int(slot_index), max(0, len(mesh.materials) - 1)))
+    face_dirs = get_face_int_attribute_values(mesh, "mv_face_dir", default_value=-1)
+    changed_count = 0
+
+    for poly in mesh.polygons:
+        is_bottom = face_dirs[poly.index] == 5
+        if not is_bottom:
+            world_normal = obj.matrix_world.to_3x3() @ poly.normal
+            is_bottom = world_normal.z < -0.9
+        if not is_bottom or poly.material_index == slot_index:
+            continue
+        poly.material_index = slot_index
+        changed_count += 1
+
+    if changed_count:
+        cells = deserialize_voxel_cells(obj)
+        face_slots = collect_voxel_face_slots_from_mesh(obj, cells)
+        store_voxel_face_slots(obj, face_slots)
+        mesh.update()
+
+    return changed_count
 
 
 def get_voxel_face_centers_world(obj):
@@ -1391,6 +1427,33 @@ def get_face_int_attribute_values(mesh, name, default_value=0):
     return [int(item.value) for item in attribute.data]
 
 
+def get_voxel_mesh_format_version(obj):
+    try:
+        return int(obj.get(VOXEL_MESH_FORMAT_VERSION_KEY, 0))
+    except Exception:
+        return 0
+
+
+def mark_voxel_mesh_format_current(obj):
+    obj[VOXEL_MESH_FORMAT_VERSION_KEY] = int(VOXEL_MESH_FORMAT_VERSION)
+
+
+def voxel_mesh_has_open_or_inverted_surface(obj):
+    if obj is None or obj.type != 'MESH' or not obj.data.polygons:
+        return False
+
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(obj.data)
+        bm.edges.ensure_lookup_table()
+        has_bad_edges = any(len(edge.link_faces) != 2 for edge in bm.edges)
+        if has_bad_edges:
+            return True
+        return bm.calc_volume(signed=True) <= 0.0
+    finally:
+        bm.free()
+
+
 def rebuild_voxel_mesh_from_cells(obj, origin, voxel_size, cells, face_slots=None, store_state=True):
     if face_slots is None:
         face_slots = deserialize_voxel_face_slots(obj)
@@ -1415,22 +1478,20 @@ def rebuild_voxel_mesh_from_cells(obj, origin, voxel_size, cells, face_slots=Non
     face_dir = []
     vert_map = {}
 
-    def get_vert_index(position):
-        key = (
-            round(float(position[0]), 9),
-            round(float(position[1]), 9),
-            round(float(position[2]), 9),
-        )
-        if key in vert_map:
-            return vert_map[key]
+    def get_vert_index(grid_key):
+        if grid_key in vert_map:
+            return vert_map[grid_key]
         index = len(verts)
-        verts.append(tuple(position))
-        vert_map[key] = index
+        verts.append((
+            origin.x + (grid_key[0] * voxel_size),
+            origin.y + (grid_key[1] * voxel_size),
+            origin.z + (grid_key[2] * voxel_size),
+        ))
+        vert_map[grid_key] = index
         return index
 
     for coord, slot_index in sorted(cells.items()):
         i, j, k = coord
-        base = origin + Vector((i * voxel_size, j * voxel_size, k * voxel_size))
         for dir_index, (neighbor_offset, corners) in enumerate(directions):
             neighbor = (
                 i + neighbor_offset[0],
@@ -1442,13 +1503,8 @@ def rebuild_voxel_mesh_from_cells(obj, origin, voxel_size, cells, face_slots=Non
 
             face = []
             for corner in corners:
-                position = (
-                    base.x + (corner[0] * voxel_size),
-                    base.y + (corner[1] * voxel_size),
-                    base.z + (corner[2] * voxel_size),
-                )
-                face.append(get_vert_index(position))
-            faces.append(tuple(face))
+                face.append(get_vert_index((i + corner[0], j + corner[1], k + corner[2])))
+            faces.append(tuple(reversed(face)))
             face_key = (i, j, k, dir_index)
             material_indices.append(max(0, int(face_slots.get(face_key, slot_index))))
             face_cell_i.append(i)
@@ -1476,7 +1532,35 @@ def rebuild_voxel_mesh_from_cells(obj, origin, voxel_size, cells, face_slots=Non
     if store_state:
         store_voxel_face_slots(obj, visible_face_slots)
         store_voxel_state(obj, origin, voxel_size, cells)
+    mark_voxel_mesh_format_current(obj)
     obj.data.update()
+
+
+def ensure_current_voxel_mesh_format(obj):
+    if obj is None:
+        return False
+
+    needs_rebuild = (
+        get_voxel_mesh_format_version(obj) < VOXEL_MESH_FORMAT_VERSION or
+        voxel_mesh_has_open_or_inverted_surface(obj)
+    )
+    if not needs_rebuild:
+        return False
+
+    origin = get_stored_voxel_origin(obj)
+    voxel_size = float(obj.get("mv_voxel_size", 0.0))
+    cells = deserialize_voxel_cells(obj)
+    if origin is None or voxel_size <= 0.0 or not cells:
+        return False
+
+    face_slots = collect_voxel_face_slots_from_mesh(obj, cells)
+    if not face_slots:
+        face_slots = deserialize_voxel_face_slots(obj)
+    else:
+        sync_voxel_cell_slots_from_face_slots(cells, face_slots)
+
+    rebuild_voxel_mesh_from_cells(obj, origin, voxel_size, cells, face_slots)
+    return True
 
 
 def remove_xy_voxel_wall_layers(obj, layer_count):
@@ -2530,16 +2614,95 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
         precision=3,
     )
 
-    skin_solidify_offset: FloatProperty(
-        name="Solidify Offset",
-        description="Solidify offset for separated skin pieces",
+    skin_solidify_thickness_mm: FloatProperty(
+        name="Skin Thickness (mm)",
+        description="Solidify thickness for separated color skin pieces",
+        default=0.4,
+        min=0.02,
+        soft_max=100.0,
+        precision=3,
+    )
+
+    skin_slot_1_solidify_thickness_mm: FloatProperty(
+        name="Slot 1 Thickness (mm)",
+        description="Solidify thickness for slot 1 skin",
+        default=0.4,
+        min=0.02,
+        soft_max=100.0,
+        precision=3,
+    )
+
+    skin_slot_1_solidify_offset: FloatProperty(
+        name="Slot 1 Offset",
+        description="Solidify offset for slot 1 skin",
         default=0.0,
         min=-1.0,
         max=1.0,
         precision=3,
     )
 
-    skin_solidify_even_thickness: BoolProperty(name="Even Thickness", default=True)
+    skin_slot_2_solidify_thickness_mm: FloatProperty(
+        name="Slot 2 Thickness (mm)",
+        description="Solidify thickness for slot 2 skin",
+        default=0.4,
+        min=0.02,
+        soft_max=100.0,
+        precision=3,
+    )
+
+    skin_slot_2_solidify_offset: FloatProperty(
+        name="Slot 2 Offset",
+        description="Solidify offset for slot 2 skin",
+        default=0.0,
+        min=-1.0,
+        max=1.0,
+        precision=3,
+    )
+
+    skin_slot_3_solidify_thickness_mm: FloatProperty(
+        name="Slot 3 Thickness (mm)",
+        description="Solidify thickness for slot 3 skin",
+        default=0.4,
+        min=0.02,
+        soft_max=100.0,
+        precision=3,
+    )
+
+    skin_slot_3_solidify_offset: FloatProperty(
+        name="Slot 3 Offset",
+        description="Solidify offset for slot 3 skin",
+        default=0.0,
+        min=-1.0,
+        max=1.0,
+        precision=3,
+    )
+
+    skin_slot_4_solidify_thickness_mm: FloatProperty(
+        name="Slot 4 Thickness (mm)",
+        description="Solidify thickness for slot 4 skin",
+        default=0.4,
+        min=0.02,
+        soft_max=100.0,
+        precision=3,
+    )
+
+    skin_slot_4_solidify_offset: FloatProperty(
+        name="Slot 4 Offset",
+        description="Solidify offset for slot 4 skin",
+        default=0.0,
+        min=-1.0,
+        max=1.0,
+        precision=3,
+    )
+
+    skin_solidify_offset: FloatProperty(
+        name="Skin Offset",
+        description="Solidify offset for separated skin pieces",
+        default=0.0,
+        min=-1.0,
+        max=1.0,
+        precision=3,
+    )
 
     color_skin_base_slot: EnumProperty(
         name="Base Slot",
@@ -2774,6 +2937,10 @@ def get_color_skin_name(root_name, slot_index, island_index=None):
     if island_index is not None:
         name += f"_{island_index + 1}"
     return name
+
+
+def get_color_skin_cutter_name(root_name):
+    return f"{root_name}_Skin_Cutter"
 
 
 def get_platform_copy_name(platform_name):
@@ -3169,12 +3336,14 @@ def ensure_solidify_modifier(obj, modifier_name, thickness, offset, use_even_thi
 
     mod.thickness = thickness
     mod.offset = offset
+    if hasattr(mod, "solidify_mode"):
+        mod.solidify_mode = 'EXTRUDE'
     if hasattr(mod, "use_even_offset"):
         mod.use_even_offset = bool(use_even_thickness)
-    if hasattr(mod, "solidify_mode"):
-        mod.solidify_mode = 'NON_MANIFOLD'
-    if hasattr(mod, "nonmanifold_thickness_mode"):
-        mod.nonmanifold_thickness_mode = 'CONSTRAINTS'
+    if hasattr(mod, "use_quality_normals"):
+        mod.use_quality_normals = True
+    if hasattr(mod, "use_rim"):
+        mod.use_rim = True
     return mod
 
 
@@ -5165,6 +5334,371 @@ def get_enabled_color_skin_slots(settings):
     return enabled_slots
 
 
+def get_skin_slot_solidify_thickness_mm(settings, slot_index):
+    return float(getattr(settings, f"skin_slot_{slot_index + 1}_solidify_thickness_mm", settings.skin_solidify_thickness_mm))
+
+
+def get_skin_slot_solidify_offset(settings, slot_index):
+    return float(getattr(settings, f"skin_slot_{slot_index + 1}_solidify_offset", settings.skin_solidify_offset))
+
+
+def get_skin_slab_offsets(thickness, offset):
+    thickness = max(0.0, float(thickness))
+    offset = max(-1.0, min(1.0, float(offset)))
+    outer_shift = thickness * (offset + 1.0) * 0.5
+    inner_shift = thickness * (offset - 1.0) * 0.5
+    return outer_shift, inner_shift
+
+
+def get_quantized_vertex_key(co, decimals=9):
+    return (
+        round(float(co.x), decimals),
+        round(float(co.y), decimals),
+        round(float(co.z), decimals),
+    )
+
+
+def get_skin_face_dir_from_poly(mesh, poly):
+    face_dir = get_face_attribute_value(mesh, "mv_face_dir", poly.index, -1)
+    if 0 <= face_dir < 6:
+        return face_dir
+
+    normal = poly.normal
+    axis = max(range(3), key=lambda item: abs(normal[item]))
+    if axis == 0:
+        return 0 if normal.x >= 0.0 else 1
+    if axis == 1:
+        return 2 if normal.y >= 0.0 else 3
+    return 4 if normal.z >= 0.0 else 5
+
+
+def get_skin_face_dir_priority(face_dir):
+    priorities = {
+        4: 0,
+        5: 1,
+        0: 2,
+        1: 3,
+        2: 4,
+        3: 5,
+    }
+    return priorities.get(int(face_dir), 99)
+
+
+def get_axis_aligned_face_box(mesh, poly, outer_shift, inner_shift):
+    normal = poly.normal.copy()
+    if normal.length < 1e-12:
+        return None
+    normal.normalize()
+
+    shifted_points = []
+    for vertex_index in poly.vertices:
+        co = mesh.vertices[vertex_index].co
+        shifted_points.append(co + (normal * outer_shift))
+        shifted_points.append(co + (normal * inner_shift))
+
+    box_min = [round(min(point[axis] for point in shifted_points), 9) for axis in range(3)]
+    box_max = [round(max(point[axis] for point in shifted_points), 9) for axis in range(3)]
+    if any(box_max[axis] - box_min[axis] <= 1e-12 for axis in range(3)):
+        return None
+    return box_min, box_max
+
+
+def get_edge_direction_axis(mesh, edge_vertices):
+    start = mesh.vertices[edge_vertices[0]].co
+    end = mesh.vertices[edge_vertices[1]].co
+    delta = end - start
+    return max(range(3), key=lambda axis: abs(delta[axis]))
+
+
+def get_skin_corner_owner(poly_a, face_dir_a, poly_b, face_dir_b):
+    priority_a = get_skin_face_dir_priority(face_dir_a)
+    priority_b = get_skin_face_dir_priority(face_dir_b)
+    if priority_a != priority_b:
+        return poly_a.index if priority_a < priority_b else poly_b.index
+    return min(poly_a.index, poly_b.index)
+
+
+def build_skin_mesh_from_occupied_grid(context, source_obj, root_name, source_name, slot_index, coords, occupied):
+    if not occupied:
+        return None
+
+    verts = []
+    faces = []
+    vertex_map = {}
+
+    def add_vertex(co):
+        key = get_quantized_vertex_key(co)
+        existing = vertex_map.get(key)
+        if existing is not None:
+            return existing
+        index = len(verts)
+        vertex_map[key] = index
+        verts.append((float(co.x), float(co.y), float(co.z)))
+        return index
+
+    def vertex_at(x, y, z):
+        return add_vertex(Vector((x, y, z)))
+
+    for ix, iy, iz in sorted(occupied):
+        x0, x1 = coords[0][ix], coords[0][ix + 1]
+        y0, y1 = coords[1][iy], coords[1][iy + 1]
+        z0, z1 = coords[2][iz], coords[2][iz + 1]
+
+        if (ix - 1, iy, iz) not in occupied:
+            faces.append((
+                vertex_at(x0, y0, z0),
+                vertex_at(x0, y0, z1),
+                vertex_at(x0, y1, z1),
+                vertex_at(x0, y1, z0),
+            ))
+        if (ix + 1, iy, iz) not in occupied:
+            faces.append((
+                vertex_at(x1, y0, z0),
+                vertex_at(x1, y1, z0),
+                vertex_at(x1, y1, z1),
+                vertex_at(x1, y0, z1),
+            ))
+        if (ix, iy - 1, iz) not in occupied:
+            faces.append((
+                vertex_at(x0, y0, z0),
+                vertex_at(x1, y0, z0),
+                vertex_at(x1, y0, z1),
+                vertex_at(x0, y0, z1),
+            ))
+        if (ix, iy + 1, iz) not in occupied:
+            faces.append((
+                vertex_at(x0, y1, z0),
+                vertex_at(x0, y1, z1),
+                vertex_at(x1, y1, z1),
+                vertex_at(x1, y1, z0),
+            ))
+        if (ix, iy, iz - 1) not in occupied:
+            faces.append((
+                vertex_at(x0, y0, z0),
+                vertex_at(x0, y1, z0),
+                vertex_at(x1, y1, z0),
+                vertex_at(x1, y0, z0),
+            ))
+        if (ix, iy, iz + 1) not in occupied:
+            faces.append((
+                vertex_at(x0, y0, z1),
+                vertex_at(x1, y0, z1),
+                vertex_at(x1, y1, z1),
+                vertex_at(x0, y1, z1),
+            ))
+
+    if not faces:
+        return None
+
+    mesh = bpy.data.meshes.new(f"{get_color_skin_name(root_name, slot_index)}_Mesh")
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+    mesh.validate(clean_customdata=False)
+    mesh.update()
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    signed_volume = bm.calc_volume(signed=True)
+    bm.free()
+    if signed_volume < 0.0:
+        mesh.flip_normals()
+        mesh.update()
+
+    if 0 <= slot_index < len(source_obj.data.materials):
+        mesh.materials.append(source_obj.data.materials[slot_index])
+
+    obj = bpy.data.objects.new(get_color_skin_name(root_name, slot_index), mesh)
+    obj.matrix_world = source_obj.matrix_world.copy()
+    context.collection.objects.link(obj)
+    set_metadata(obj, root_name, source_name)
+    for poly in obj.data.polygons:
+        poly.material_index = 0
+    obj.data.update()
+    return obj
+
+
+def build_boxes_skin_mesh(context, source_obj, root_name, source_name, slot_index, boxes):
+    if not boxes:
+        return None
+
+    coord_sets = [set(), set(), set()]
+    for box_min, box_max in boxes:
+        for axis in range(3):
+            coord_sets[axis].add(round(float(box_min[axis]), 9))
+            coord_sets[axis].add(round(float(box_max[axis]), 9))
+
+    coords = [sorted(values) for values in coord_sets]
+    if any(len(axis_coords) < 2 for axis_coords in coords):
+        return None
+
+    coord_indices = [
+        {value: index for index, value in enumerate(axis_coords)}
+        for axis_coords in coords
+    ]
+
+    occupied = set()
+    for box_min, box_max in boxes:
+        rounded_min = [round(float(box_min[axis]), 9) for axis in range(3)]
+        rounded_max = [round(float(box_max[axis]), 9) for axis in range(3)]
+        min_indices = [coord_indices[axis][rounded_min[axis]] for axis in range(3)]
+        max_indices = [coord_indices[axis][rounded_max[axis]] for axis in range(3)]
+        for ix in range(min_indices[0], max_indices[0]):
+            for iy in range(min_indices[1], max_indices[1]):
+                for iz in range(min_indices[2], max_indices[2]):
+                    occupied.add((ix, iy, iz))
+
+    return build_skin_mesh_from_occupied_grid(context, source_obj, root_name, source_name, slot_index, coords, occupied)
+
+
+def build_owned_skin_slab_objects(context, source_obj, root_name, source_name, slot_indices, thickness_by_slot, offset_by_slot):
+    if source_obj is None or source_obj.type != 'MESH':
+        return []
+
+    source_mesh = source_obj.data
+    coord_sets = [set(), set(), set()]
+    box_records = []
+    selected_counts = {slot_index: 0 for slot_index in slot_indices}
+
+    for slot_index in slot_indices:
+        outer_shift, inner_shift = get_skin_slab_offsets(
+            thickness_by_slot.get(slot_index, 0.0),
+            offset_by_slot.get(slot_index, 0.0),
+        )
+        for poly in source_mesh.polygons:
+            if poly.material_index != slot_index:
+                continue
+            selected_counts[slot_index] += 1
+            box = get_axis_aligned_face_box(source_mesh, poly, outer_shift, inner_shift)
+            if box is None:
+                continue
+            box_min, box_max = box
+            box_records.append((slot_index, tuple(box_min), tuple(box_max)))
+            for axis in range(3):
+                coord_sets[axis].add(box_min[axis])
+                coord_sets[axis].add(box_max[axis])
+
+    if not box_records:
+        return [
+            (slot_index, None, selected_counts.get(slot_index, 0))
+            for slot_index in slot_indices
+        ]
+
+    coords = [sorted(values) for values in coord_sets]
+    if any(len(axis_coords) < 2 for axis_coords in coords):
+        return [
+            (slot_index, None, selected_counts.get(slot_index, 0))
+            for slot_index in slot_indices
+        ]
+
+    coord_indices = [
+        {value: index for index, value in enumerate(axis_coords)}
+        for axis_coords in coords
+    ]
+
+    owner_by_cell = {}
+    for slot_index, box_min, box_max in sorted(box_records, key=lambda item: item[0]):
+        min_indices = [coord_indices[axis][box_min[axis]] for axis in range(3)]
+        max_indices = [coord_indices[axis][box_max[axis]] for axis in range(3)]
+        for ix in range(min_indices[0], max_indices[0]):
+            for iy in range(min_indices[1], max_indices[1]):
+                for iz in range(min_indices[2], max_indices[2]):
+                    cell = (ix, iy, iz)
+                    current_owner = owner_by_cell.get(cell)
+                    if current_owner is None or slot_index < current_owner:
+                        owner_by_cell[cell] = slot_index
+
+    occupied_by_slot = {slot_index: set() for slot_index in slot_indices}
+    for cell, slot_index in owner_by_cell.items():
+        if slot_index in occupied_by_slot:
+            occupied_by_slot[slot_index].add(cell)
+
+    results = []
+    for slot_index in slot_indices:
+        obj = build_skin_mesh_from_occupied_grid(
+            context,
+            source_obj,
+            root_name,
+            source_name,
+            slot_index,
+            coords,
+            occupied_by_slot.get(slot_index, set()),
+        )
+        results.append((slot_index, obj, selected_counts.get(slot_index, 0)))
+    return results
+
+
+def build_skin_slab_object_from_material_slot(context, source_obj, root_name, source_name, slot_index, thickness, offset):
+    if source_obj is None or source_obj.type != 'MESH':
+        return None, 0
+
+    source_mesh = source_obj.data
+    source_polys = [poly for poly in source_mesh.polygons if poly.material_index == slot_index]
+    if not source_polys:
+        return None, 0
+
+    outer_shift, inner_shift = get_skin_slab_offsets(thickness, offset)
+    extension = abs(float(thickness))
+    source_poly_indices = {poly.index for poly in source_polys}
+    boxes_by_poly = {}
+    face_dirs = {}
+    edge_to_selected_polys = {}
+
+    for poly in source_polys:
+        box = get_axis_aligned_face_box(source_mesh, poly, outer_shift, inner_shift)
+        if box is None:
+            continue
+        boxes_by_poly[poly.index] = [box[0], box[1]]
+        face_dirs[poly.index] = get_skin_face_dir_from_poly(source_mesh, poly)
+        poly_vertices = list(poly.vertices)
+        for a, b in zip(poly_vertices, poly_vertices[1:] + poly_vertices[:1]):
+            edge_to_selected_polys.setdefault(tuple(sorted((a, b))), []).append(poly.index)
+
+    for edge_key, linked_indices in edge_to_selected_polys.items():
+        linked_indices = [
+            poly_index
+            for poly_index in linked_indices
+            if poly_index in source_poly_indices and poly_index in boxes_by_poly
+        ]
+        if len(linked_indices) < 2:
+            continue
+
+        for first_index, poly_a_index in enumerate(linked_indices):
+            poly_a = source_mesh.polygons[poly_a_index]
+            face_dir_a = face_dirs[poly_a_index]
+            normal_axis_a = get_axis_for_face_dir(face_dir_a)
+            edge_axis = get_edge_direction_axis(source_mesh, edge_key)
+            if edge_axis == normal_axis_a:
+                continue
+
+            for poly_b_index in linked_indices[first_index + 1:]:
+                face_dir_b = face_dirs[poly_b_index]
+                normal_axis_b = get_axis_for_face_dir(face_dir_b)
+                if normal_axis_a == normal_axis_b:
+                    continue
+                if edge_axis == normal_axis_b:
+                    continue
+
+                owner_index = get_skin_corner_owner(poly_a, face_dir_a, source_mesh.polygons[poly_b_index], face_dir_b)
+                owner_face_dir = face_dirs[owner_index]
+                owner_normal_axis = get_axis_for_face_dir(owner_face_dir)
+                side_axis = next(
+                    axis
+                    for axis in range(3)
+                    if axis != owner_normal_axis and axis != edge_axis
+                )
+                box_min, box_max = boxes_by_poly[owner_index]
+                edge_value = source_mesh.vertices[edge_key[0]].co[side_axis]
+                center_value = (box_min[side_axis] + box_max[side_axis]) * 0.5
+                if edge_value >= center_value:
+                    box_max[side_axis] = round(box_max[side_axis] + extension, 9)
+                else:
+                    box_min[side_axis] = round(box_min[side_axis] - extension, 9)
+
+    boxes = [(tuple(box_min), tuple(box_max)) for box_min, box_max in boxes_by_poly.values()]
+    obj = build_boxes_skin_mesh(context, source_obj, root_name, source_name, slot_index, boxes)
+
+    return obj, len(source_polys)
+
+
 def get_used_material_slots(obj):
     return sorted({poly.material_index for poly in obj.data.polygons})
 
@@ -5275,6 +5809,8 @@ def boolean_union_objects(context, objects, new_name, solver='EXACT'):
         mod.object = cutter_obj
         if hasattr(mod, "solver"):
             mod.solver = solver
+        if hasattr(mod, "use_self"):
+            mod.use_self = True
         bpy.ops.object.modifier_apply(modifier=mod.name)
         remove_object_if_exists(cutter_obj)
 
@@ -8214,6 +8750,7 @@ class MINIATUREVOXELER_OT_separate_skins_solidify(Operator):
         if body_obj is None:
             self.report({'ERROR'}, "Run Step 2 Block Remesh first so the _Blocks object exists.")
             return {'CANCELLED'}
+        ensure_current_voxel_mesh_format(body_obj)
 
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
@@ -8233,6 +8770,8 @@ class MINIATUREVOXELER_OT_separate_skins_solidify(Operator):
             self.report({'ERROR'}, "The selected base slot does not exist on this object.")
             return {'CANCELLED'}
 
+        assign_bottom_voxel_faces_to_slot(body_obj, int(settings.platform_foot_color_slot))
+
         root_name = get_root_name(body_obj.name)
         source_name = get_inferred_source_name(settings, body_obj)
 
@@ -8250,67 +8789,44 @@ class MINIATUREVOXELER_OT_separate_skins_solidify(Operator):
             get_slot_palette_color(settings, base_slot_index),
         )
         apply_single_material_to_object(base_obj, base_material)
-        ensure_solidify_modifier(
-            base_obj,
-            "SkinSolidify",
-            mm_to_scene_units(context, settings.outer_skin_mm),
-            settings.skin_solidify_offset + 0.03,
-            settings.skin_solidify_even_thickness,
-        )
-        apply_modifier_if_present(context, base_obj, "SkinSolidify")
-
-        skin_source = duplicate_object(context, body_obj, f"{root_name}_Lego_Skin_Source")
-        set_metadata(skin_source, root_name, source_name)
 
         processed = []
         skipped = []
 
-        for slot_index in enabled_skin_slots:
-            if skin_source is None or skin_source.name not in bpy.data.objects:
-                self.report({'ERROR'}, "Skin source object became invalid.")
-                return {'CANCELLED'}
+        thickness_by_slot = {
+            slot_index: mm_to_scene_units(context, get_skin_slot_solidify_thickness_mm(settings, slot_index))
+            for slot_index in enabled_skin_slots
+        }
+        offset_by_slot = {
+            slot_index: get_skin_slot_solidify_offset(settings, slot_index)
+            for slot_index in enabled_skin_slots
+        }
+        skin_results = build_owned_skin_slab_objects(
+            context,
+            body_obj,
+            root_name,
+            source_name,
+            enabled_skin_slots,
+            thickness_by_slot,
+            offset_by_slot,
+        )
 
-            set_active_object(context, skin_source)
-            bpy.ops.object.mode_set(mode='EDIT')
-            bpy.ops.mesh.select_mode(type='FACE')
-            bpy.ops.mesh.select_all(action='DESELECT')
-
-            selected_count = select_faces_by_material_slot(skin_source, [slot_index])
+        for slot_index, new_obj, selected_count in skin_results:
             if selected_count == 0:
-                bpy.ops.object.mode_set(mode='OBJECT')
                 skipped.append(f"Slot {slot_index + 1}")
                 continue
 
-            pre_names = set(obj.name for obj in bpy.data.objects)
-            bpy.ops.mesh.separate(type='SELECTED')
-            bpy.ops.object.mode_set(mode='OBJECT')
-
-            new_obj = find_new_object(pre_names, skin_source, context)
             if new_obj is None:
-                self.report({'ERROR'}, f"Could not identify separated skin object for slot {slot_index + 1}.")
+                self.report({'ERROR'}, f"Could not build skin slab object for slot {slot_index + 1}.")
                 return {'CANCELLED'}
-
-            new_obj.name = get_color_skin_name(root_name, slot_index)
-            set_metadata(new_obj, root_name, source_name)
-            ensure_solidify_modifier(
-                new_obj,
-                "SkinSolidify",
-                mm_to_scene_units(context, settings.outer_skin_mm),
-                settings.skin_solidify_offset,
-                settings.skin_solidify_even_thickness,
-            )
-            apply_modifier_if_present(context, new_obj, "SkinSolidify")
 
             label = f"Slot {slot_index + 1} ({selected_count} faces)"
             processed.append(label)
 
         if not processed:
-            remove_object_if_exists(skin_source)
             set_active_object(context, base_obj)
             self.report({'WARNING'}, "No faces found for the selected skin slots.")
             return {'CANCELLED'}
-
-        remove_object_if_exists(skin_source)
 
         body_obj.hide_set(True)
         set_active_object(context, base_obj)
@@ -8318,7 +8834,7 @@ class MINIATUREVOXELER_OT_separate_skins_solidify(Operator):
         msg = "Processed: " + ", ".join(processed)
         if skipped:
             msg += " | Skipped: " + ", ".join(skipped)
-        msg += " | Solidify applied | _Blocks hidden"
+        msg += " | Custom skin slab meshes generated | _Blocks hidden"
 
         self.report({'INFO'}, msg)
         return {'FINISHED'}
@@ -8354,17 +8870,6 @@ class MINIATUREVOXELER_OT_add_skin_booleans(Operator):
             )
             added_count += 1
 
-        for winner_index, winner_obj in enumerate(skin_objects):
-            for target_obj in skin_objects[winner_index + 1:]:
-                ensure_boolean_modifier(
-                    target_obj,
-                    winner_obj,
-                    f"SkinBoolean_Slot_{winner_obj.name}",
-                    operation='DIFFERENCE',
-                    solver='EXACT',
-                )
-                added_count += 1
-
         if foot_obj is not None:
             for target_obj in [base_obj] + skin_objects:
                 ensure_boolean_modifier(
@@ -8377,8 +8882,9 @@ class MINIATUREVOXELER_OT_add_skin_booleans(Operator):
                 added_count += 1
 
         set_active_object(context, base_obj)
+        cutter_text = " Each skin cuts _Base directly; no combined _Skin_Cutter is created."
         foot_text = " Foot cuts _Base and all skins." if foot_obj is not None else " No _foot found; foot booleans skipped."
-        self.report({'INFO'}, f"Added {added_count} Exact boolean modifier(s). Lower slot numbers trim higher slots.{foot_text}")
+        self.report({'INFO'}, f"Added {added_count} Exact boolean modifier(s). Skin slots are generated without skin-to-skin booleans.{cutter_text}{foot_text}")
         return {'FINISHED'}
 
 
@@ -9895,18 +10401,18 @@ class MINIATUREVOXELER_PT_panel(Panel):
             box = self.draw_step_box(layout, 'BUILDING', "2.7 Prepare Skin")
             col = box.column(align=True)
             col.prop(settings, "color_skin_base_slot")
-            col.prop(settings, "outer_skin_mm")
-            col.prop(settings, "skin_solidify_offset")
-            col.prop(settings, "skin_solidify_even_thickness")
 
             box.label(text="Skin Slots")
-            row = box.row(align=True)
-            row.prop(settings, "color_skin_slot_1")
-            row.prop(settings, "color_skin_slot_2")
-
-            row = box.row(align=True)
-            row.prop(settings, "color_skin_slot_3")
-            row.prop(settings, "color_skin_slot_4")
+            base_slot_index = int(settings.color_skin_base_slot)
+            for slot_index in range(4):
+                slot_box = box.box()
+                slot_box.enabled = slot_index != base_slot_index
+                row = slot_box.row(align=True)
+                row.prop(settings, f"color_skin_slot_{slot_index + 1}", text=f"Slot {slot_index + 1}")
+                if slot_index == base_slot_index:
+                    row.label(text="Base", icon='RADIOBUT_ON')
+                slot_box.prop(settings, f"skin_slot_{slot_index + 1}_solidify_thickness_mm")
+                slot_box.prop(settings, f"skin_slot_{slot_index + 1}_solidify_offset")
 
             box.operator("object.miniature_voxeler_separate_skins_solidify", text="Separate Skins and Solidify", icon='MATERIAL')
             caution_row = box.row(align=True)
