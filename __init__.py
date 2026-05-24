@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Miniature Voxeler",
     "author": "Diego Muhr",
-    "version": (5, 0, 19),
+    "version": (5, 0, 20),
     "blender": (5, 0, 1),
     "location": "3D View > Sidebar > Miniature Voxeler",
     "description": "Block remesh, transfer texture, create Lego-color face materials, and generate Lego skin meshes for miniature voxel workflows",
@@ -32,7 +32,7 @@ from bpy.props import (
     EnumProperty,
 )
 
-ADDON_VERSION_TEXT = "v.5.0.19"
+ADDON_VERSION_TEXT = "v.5.0.20"
 VOXEL_MESH_FORMAT_VERSION = 405
 VOXEL_MESH_FORMAT_VERSION_KEY = "mv_voxel_mesh_format_version"
 
@@ -2659,7 +2659,7 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
             ('TOP', "Top Layer", "Fill only the top voxel layer for this slot"),
             ('COLUMN', "Column", "Fill hidden column volume below the top region for this slot"),
         ],
-        default='COLUMN',
+        default='TOP',
     )
 
     skin_slot_1_solidify_thickness_mm: FloatProperty(
@@ -2702,7 +2702,7 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
             ('TOP', "Top Layer", "Fill only the top voxel layer for this slot"),
             ('COLUMN', "Column", "Fill hidden column volume below the top region for this slot"),
         ],
-        default='COLUMN',
+        default='TOP',
     )
 
     skin_slot_2_solidify_thickness_mm: FloatProperty(
@@ -2745,7 +2745,7 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
             ('TOP', "Top Layer", "Fill only the top voxel layer for this slot"),
             ('COLUMN', "Column", "Fill hidden column volume below the top region for this slot"),
         ],
-        default='COLUMN',
+        default='TOP',
     )
 
     skin_slot_3_solidify_thickness_mm: FloatProperty(
@@ -2788,7 +2788,7 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
             ('TOP', "Top Layer", "Fill only the top voxel layer for this slot"),
             ('COLUMN', "Column", "Fill hidden column volume below the top region for this slot"),
         ],
-        default='COLUMN',
+        default='TOP',
     )
 
     skin_slot_4_solidify_thickness_mm: FloatProperty(
