@@ -8,7 +8,7 @@ from mathutils import Vector
 
 ROOT = "/Users/diegomuhr/Documents/Unreal Projects/TMN_BlenderPlugin"
 ADDON_PATH = os.path.join(ROOT, "__init__.py")
-OUTPUT_PATH = os.path.join(ROOT, "Skin_Interaction_Cases_v508.blend")
+OUTPUT_PATH = os.path.join(ROOT, "Skin_Interaction_Cases_v510.blend")
 
 
 def load_addon():

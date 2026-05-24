@@ -8,11 +8,11 @@ import bpy
 
 ROOT = "/Users/diegomuhr/Documents/Unreal Projects/TMN_BlenderPlugin"
 ADDON_PATH = os.path.join(ROOT, "__init__.py")
-OUTPUT_PATH = "/Users/diegomuhr/Downloads/TEMPELHOF_skin_v510_fractional.blend"
+OUTPUT_PATH = "/Users/diegomuhr/Downloads/termo/TERMAS_skin_v518_fractional.blend"
 
 
 def load_addon():
-    spec = importlib.util.spec_from_file_location("miniature_voxeler_tempelhof_separate", ADDON_PATH)
+    spec = importlib.util.spec_from_file_location("miniature_voxeler_termas_separate", ADDON_PATH)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -47,15 +47,38 @@ settings.color_skin_slot_1 = False
 settings.color_skin_slot_2 = True
 settings.color_skin_slot_3 = True
 settings.color_skin_slot_4 = True
+settings.skin_subdivision_steps = 8
+settings.skin_solid_single_color_regions = True
 for slot in (2, 3, 4):
     setattr(settings, f"skin_slot_{slot}_thickness_steps", 2)
-settings.skin_subdivision_steps = 8
+settings.skin_slot_2_solid_region_mode = 'TOP'
+settings.skin_slot_3_solid_region_mode = 'TOP'
+settings.skin_slot_4_solid_region_mode = 'COLUMN'
 
 print("separate_start", flush=True)
 separate_result = bpy.ops.object.miniature_voxeler_separate_skins_solidify()
 print("separate_result", separate_result, flush=True)
 
 root_name = module.get_root_name(blocks.name)
+base_obj = next((obj for obj in bpy.data.objects if obj.name == module.get_color_base_name(root_name)), None)
+if base_obj is not None:
+    boundary, nonmanifold, volume = mesh_stats(base_obj)
+    print(
+        "base",
+        base_obj.name,
+        "verts",
+        len(base_obj.data.vertices),
+        "faces",
+        len(base_obj.data.polygons),
+        "boundary",
+        boundary,
+        "nonmanifold",
+        nonmanifold,
+        "volume",
+        round(volume, 8),
+        flush=True,
+    )
+
 skins = [obj for obj in bpy.data.objects if "_Lego_Skin_Slot_" in obj.name and module.get_root_name(obj.name) == root_name]
 for obj in sorted(skins, key=lambda item: item.name):
     boundary, nonmanifold, volume = mesh_stats(obj)
