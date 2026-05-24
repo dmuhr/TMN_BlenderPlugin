@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Miniature Voxeler",
     "author": "Diego Muhr",
-    "version": (5, 0, 18),
+    "version": (5, 0, 19),
     "blender": (5, 0, 1),
     "location": "3D View > Sidebar > Miniature Voxeler",
     "description": "Block remesh, transfer texture, create Lego-color face materials, and generate Lego skin meshes for miniature voxel workflows",
@@ -32,7 +32,7 @@ from bpy.props import (
     EnumProperty,
 )
 
-ADDON_VERSION_TEXT = "v.5.0.18"
+ADDON_VERSION_TEXT = "v.5.0.19"
 VOXEL_MESH_FORMAT_VERSION = 405
 VOXEL_MESH_FORMAT_VERSION_KEY = "mv_voxel_mesh_format_version"
 
@@ -3373,6 +3373,9 @@ def resolve_export_directory(settings):
 def export_object_to_stl(context, obj, filepath, scale=1000.0):
     if context.mode != 'OBJECT':
         bpy.ops.object.mode_set(mode='OBJECT')
+
+    if os.path.isfile(filepath):
+        os.remove(filepath)
 
     bpy.ops.object.select_all(action='DESELECT')
     obj.select_set(True)
@@ -9531,14 +9534,18 @@ class MINIATUREVOXELER_OT_export_final_pieces(Operator):
             target_blend = os.path.join(export_dir, blend_filename)
             try:
                 if os.path.abspath(blend_path) != os.path.abspath(target_blend):
+                    if os.path.isfile(target_blend):
+                        os.remove(target_blend)
                     bpy.ops.wm.save_as_mainfile(filepath=target_blend, copy=True)
-                    blend_copy_text = "Blend copy added."
+                    blend_copy_text = "Blend copy overwritten."
                 else:
                     blend_copy_text = "Blend file already in export folder."
             except Exception as save_copy_error:
                 if blend_path and os.path.isfile(blend_path) and os.path.abspath(blend_path) != os.path.abspath(target_blend):
+                    if os.path.isfile(target_blend):
+                        os.remove(target_blend)
                     shutil.copy2(blend_path, target_blend)
-                    blend_copy_text = "Blend disk copy added."
+                    blend_copy_text = "Blend disk copy overwritten."
                 else:
                     blend_copy_text = f"Blend copy skipped: {save_copy_error}"
 
@@ -10988,12 +10995,6 @@ class MINIATUREVOXELER_PT_panel(Panel):
                 slot_box.prop(settings, f"skin_slot_{slot_index + 1}_solid_region_mode")
 
             box.operator("object.miniature_voxeler_separate_skins_solidify", text="Separate Skins and Solidify", icon='MATERIAL')
-            caution_row = box.row(align=True)
-            caution_row.alert = True
-            caution_row.operator("object.miniature_voxeler_add_skin_booleans", text="Add Booleans (Warning, Slow!)", icon='MOD_BOOLEAN')
-            apply_row = box.row(align=True)
-            apply_row.alert = True
-            apply_row.operator("object.miniature_voxeler_apply_skin_booleans", text="Apply Booleans (Warning, Slow!)", icon='CHECKMARK')
 
         if self.draw_path_divider(layout, settings, 'EXPORT', "show_export_steps"):
             box = self.draw_step_box(layout, 'EXPORT', "3. Export")
