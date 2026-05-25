@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Miniature Voxeler",
     "author": "Diego Muhr",
-    "version": (5, 0, 21),
+    "version": (5, 0, 23),
     "blender": (5, 0, 1),
     "location": "3D View > Sidebar > Miniature Voxeler",
     "description": "Block remesh, transfer texture, create Lego-color face materials, and generate Lego skin meshes for miniature voxel workflows",
@@ -32,7 +32,7 @@ from bpy.props import (
     EnumProperty,
 )
 
-ADDON_VERSION_TEXT = "v.5.0.21"
+ADDON_VERSION_TEXT = "v.5.0.23"
 VOXEL_MESH_FORMAT_VERSION = 405
 VOXEL_MESH_FORMAT_VERSION_KEY = "mv_voxel_mesh_format_version"
 
@@ -2208,4 +2208,3 @@ def edit_voxel_cells_with_brush(context, event, obj, action, slot_index, brush_s
     if rebuild:
         rebuild_voxel_mesh_from_cells(obj, origin, voxel_size, cells, face_slots)
     return len(touched)
-

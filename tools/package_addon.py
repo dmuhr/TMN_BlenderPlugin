@@ -6,7 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_NAME = "miniature_voxeler"
-DIST_DIR = ROOT / "dist"
+PACKAGED_DIR = ROOT / "packaged"
 
 PACKAGE_FILES = (
     "__init__.py",
@@ -37,8 +37,8 @@ def read_version():
 
 def main():
     version = read_version()
-    DIST_DIR.mkdir(exist_ok=True)
-    output = DIST_DIR / f"MiniatureVoxeler_v{version}.zip"
+    PACKAGED_DIR.mkdir(exist_ok=True)
+    output = PACKAGED_DIR / f"MiniatureVoxeler_v{version}.zip"
 
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for relative_path in PACKAGE_FILES:

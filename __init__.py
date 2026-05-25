@@ -4,6 +4,16 @@
 # namespace to preserve Blender registration behavior and existing background
 # scripts that import this __init__.py directly.
 
+bl_info = {
+    "name": "Miniature Voxeler",
+    "author": "Diego Muhr",
+    "version": (5, 0, 23),
+    "blender": (5, 0, 1),
+    "location": "3D View > Sidebar > Miniature Voxeler",
+    "description": "Block remesh, transfer texture, create Lego-color face materials, and generate Lego skin meshes for miniature voxel workflows",
+    "category": "Object",
+}
+
 from pathlib import Path
 
 _PARTS = (
@@ -28,7 +38,7 @@ if _missing:
         "Miniature Voxeler is installed as modular source, but Blender cannot "
         "find the companion files next to __init__.py: "
         f"{', '.join(_missing)}. Install the whole addon folder/zip, or use "
-        "the latest compressed addon package from dist/."
+        "the latest compressed addon package from packaged/."
     )
 
 for _part in _PARTS:

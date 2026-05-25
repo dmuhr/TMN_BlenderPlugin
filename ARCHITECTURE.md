@@ -7,7 +7,7 @@ This addon is split by workflow while preserving the original Blender addon entr
 - `__init__.py` loads the implementation files in a fixed order and exposes `register()` / `unregister()` for Blender.
 - Keep `bl_info`, imports, constants, and low-level voxel state helpers in `bootstrap.py`.
 - Keep Blender class registration in `registration.py`.
-- Install/update Blender from the latest compressed addon package in `dist/`.
+- Install/update Blender from the latest compressed addon package in `packaged/`.
 - Do not use Blender text blocks or `.blend`-embedded scripts as the normal update path.
 
 ## Where To Work
