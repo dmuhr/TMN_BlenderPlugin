@@ -7,7 +7,7 @@
 bl_info = {
     "name": "Miniature Voxeler",
     "author": "Diego Muhr",
-    "version": (5, 0, 23),
+    "version": (6, 0, 0),
     "blender": (5, 0, 1),
     "location": "3D View > Sidebar > Miniature Voxeler",
     "description": "Block remesh, transfer texture, create Lego-color face materials, and generate Lego skin meshes for miniature voxel workflows",

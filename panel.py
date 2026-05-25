@@ -171,7 +171,6 @@ class MINIATUREVOXELER_PT_panel(Panel):
             # Step 2.1 switches back to the building branch and creates the block mesh.
             box = self.draw_step_box(layout, 'BUILDING', "2.1 Voxel Building")
             voxel_col = box.column(align=True)
-            voxel_col.prop(settings, "octree_depth")
             voxel_col.prop(settings, "scale")
             voxel_col.prop(settings, "voxel_size_mm")
             voxel_col.prop(settings, "threshold")

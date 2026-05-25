@@ -84,9 +84,13 @@ def register():
 
 
 def unregister():
-    del bpy.types.Scene.miniature_voxeler_settings
+    if hasattr(bpy.types.Scene, "miniature_voxeler_settings"):
+        del bpy.types.Scene.miniature_voxeler_settings
     for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+        try:
+            bpy.utils.unregister_class(cls)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

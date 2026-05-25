@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Miniature Voxeler",
     "author": "Diego Muhr",
-    "version": (5, 0, 23),
+    "version": (6, 0, 0),
     "blender": (5, 0, 1),
     "location": "3D View > Sidebar > Miniature Voxeler",
     "description": "Block remesh, transfer texture, create Lego-color face materials, and generate Lego skin meshes for miniature voxel workflows",
@@ -16,7 +16,7 @@ import os
 import shutil
 from collections import deque
 from gpu_extras.batch import batch_for_shader
-from math import atan2, cos, floor, hypot, pi, radians, sin
+from math import atan2, cos, floor, hypot, log2, pi, radians, sin
 from time import perf_counter
 from bpy_extras import view3d_utils
 from mathutils import Vector, geometry
@@ -32,7 +32,7 @@ from bpy.props import (
     EnumProperty,
 )
 
-ADDON_VERSION_TEXT = "v.5.0.23"
+ADDON_VERSION_TEXT = "v.6.0.0"
 VOXEL_MESH_FORMAT_VERSION = 405
 VOXEL_MESH_FORMAT_VERSION_KEY = "mv_voxel_mesh_format_version"
 
@@ -1106,12 +1106,81 @@ def is_point_inside_evaluated_mesh(obj_eval, point_world, ray_distance, epsilon=
     return False
 
 
-def fill_enclosed_voxel_cavities(cells, counts, fill_slot=0):
+def collect_top_open_empty_voxels(cells, counts):
+    protected = set()
+    if not cells:
+        return protected
+
+    max_i, max_j, max_k = counts
+    for i in range(max_i):
+        for j in range(max_j):
+            for k in range(max_k - 1, -1, -1):
+                coord = (i, j, k)
+                if coord in cells:
+                    break
+                protected.add(coord)
+    return protected
+
+
+def collect_exterior_empty_voxels(cells, counts, seed_empty=None):
+    outside = set()
+    queue = deque()
+    max_i, max_j, max_k = counts
+
+    def enqueue_if_empty(coord):
+        if (
+            coord[0] < 0 or coord[0] >= max_i or
+            coord[1] < 0 or coord[1] >= max_j or
+            coord[2] < 0 or coord[2] >= max_k
+        ):
+            return
+        if coord in cells or coord in outside:
+            return
+        outside.add(coord)
+        queue.append(coord)
+
+    if seed_empty:
+        for coord in seed_empty:
+            enqueue_if_empty(coord)
+
+    for i in range(max_i):
+        for j in range(max_j):
+            enqueue_if_empty((i, j, 0))
+            enqueue_if_empty((i, j, max_k - 1))
+    for i in range(max_i):
+        for k in range(max_k):
+            enqueue_if_empty((i, 0, k))
+            enqueue_if_empty((i, max_j - 1, k))
+    for j in range(max_j):
+        for k in range(max_k):
+            enqueue_if_empty((0, j, k))
+            enqueue_if_empty((max_i - 1, j, k))
+
+    neighbors = (
+        (1, 0, 0),
+        (-1, 0, 0),
+        (0, 1, 0),
+        (0, -1, 0),
+        (0, 0, 1),
+        (0, 0, -1),
+    )
+    while queue:
+        i, j, k = queue.popleft()
+        for di, dj, dk in neighbors:
+            enqueue_if_empty((i + di, j + dj, k + dk))
+
+    return outside
+
+
+def fill_enclosed_voxel_cavities(cells, counts, fill_slot=0, protected_empty=None, should_fill_empty=None):
     if not cells:
         return 0
 
+    if protected_empty is None:
+        protected_empty = set()
+
     max_i, max_j, max_k = counts
-    outside = set()
+    outside = set(protected_empty)
     queue = deque()
 
     def enqueue_if_empty(coord):
@@ -1160,15 +1229,22 @@ def fill_enclosed_voxel_cavities(cells, counts, fill_slot=0):
                 coord = (i, j, k)
                 if coord in cells or coord in outside:
                     continue
+                if coord in protected_empty:
+                    continue
+                if should_fill_empty is not None and not should_fill_empty(coord):
+                    continue
                 cells[coord] = int(fill_slot)
                 filled_count += 1
 
     return filled_count
 
 
-def fill_vertical_voxel_columns(cells, fill_slot=0):
+def fill_vertical_voxel_columns(cells, fill_slot=0, protected_empty=None, should_fill_empty=None):
     if not cells:
         return 0
+
+    if protected_empty is None:
+        protected_empty = set()
 
     z_bounds_by_column = {}
     for i, j, k in cells.keys():
@@ -1186,15 +1262,22 @@ def fill_vertical_voxel_columns(cells, fill_slot=0):
             coord = (i, j, k)
             if coord in cells:
                 continue
+            if coord in protected_empty:
+                continue
+            if should_fill_empty is not None and not should_fill_empty(coord):
+                continue
             cells[coord] = int(fill_slot)
             filled_count += 1
 
     return filled_count
 
 
-def fill_enclosed_xy_voxel_slice_holes(cells, fill_slot=0):
+def fill_enclosed_xy_voxel_slice_holes(cells, fill_slot=0, protected_empty=None, should_fill_empty=None):
     if not cells:
         return 0
+
+    if protected_empty is None:
+        protected_empty = set()
 
     cells_by_z = {}
     for i, j, k in cells.keys():
@@ -1232,6 +1315,10 @@ def fill_enclosed_xy_voxel_slice_holes(cells, fill_slot=0):
                     continue
                 coord = (i, j, k)
                 if coord in cells:
+                    continue
+                if coord in protected_empty:
+                    continue
+                if should_fill_empty is not None and not should_fill_empty(coord):
                     continue
                 cells[coord] = int(fill_slot)
                 filled_count += 1
@@ -1651,15 +1738,217 @@ def generate_voxel_cells_from_object(context, source_obj, settings):
     cells = {}
 
     surface_cell_count = mark_surface_voxel_cells_from_object(source_eval, origin, voxel_size, counts, cells)
-    cavity_fill_count = fill_enclosed_voxel_cavities(cells, counts)
-    vertical_fill_count = fill_vertical_voxel_columns(cells)
-    xy_slice_fill_count = fill_enclosed_xy_voxel_slice_holes(cells)
+    top_open_empty_voxels = set()
+    exterior_empty_voxels = set()
+    cavity_fill_count = 0
+    vertical_fill_count = 0
+    xy_slice_fill_count = 0
+
+    if bool(getattr(settings, "voxel_fill_interior", False)):
+        top_open_empty_voxels = collect_top_open_empty_voxels(cells, counts)
+        exterior_empty_voxels = collect_exterior_empty_voxels(cells, counts, seed_empty=top_open_empty_voxels)
+        bbox_diagonal = (bbox_max - bbox_min).length
+        ray_distance = max(voxel_size * max(counts) * 2.0, bbox_diagonal * 2.0, voxel_size * 8.0)
+
+        def should_fill_empty(coord):
+            center = origin + Vector((
+                (coord[0] + 0.5) * voxel_size,
+                (coord[1] + 0.5) * voxel_size,
+                (coord[2] + 0.5) * voxel_size,
+            ))
+            return is_point_inside_evaluated_mesh(source_eval, center, ray_distance, epsilon=voxel_size * 0.01)
+
+        cavity_fill_count = fill_enclosed_voxel_cavities(cells, counts, protected_empty=exterior_empty_voxels, should_fill_empty=should_fill_empty)
+        vertical_fill_count = fill_vertical_voxel_columns(cells, protected_empty=exterior_empty_voxels, should_fill_empty=should_fill_empty)
+        xy_slice_fill_count = fill_enclosed_xy_voxel_slice_holes(cells, protected_empty=exterior_empty_voxels, should_fill_empty=should_fill_empty)
     stats = {
         "surface_cell_count": surface_cell_count,
+        "top_open_empty_count": len(top_open_empty_voxels),
+        "exterior_empty_count": len(exterior_empty_voxels),
         "cavity_fill_count": cavity_fill_count,
         "vertical_fill_count": vertical_fill_count,
         "xy_slice_fill_count": xy_slice_fill_count,
     }
+    return origin, voxel_size, cells, stats
+
+
+def get_blender_blocks_octree_depth_for_target_size(context, settings, source_obj):
+    target_voxel_size = mm_to_scene_units(context, settings.voxel_size_mm)
+    if target_voxel_size <= 0.0:
+        return int(settings.octree_depth)
+
+    max_dimension = max(float(source_obj.dimensions.x), float(source_obj.dimensions.y), float(source_obj.dimensions.z))
+    if max_dimension <= 0.0:
+        return int(settings.octree_depth)
+
+    scale = max(float(settings.scale), 0.0001)
+    depth = int(round(log2(max_dimension * scale / target_voxel_size)))
+    return max(1, min(depth, 24))
+
+
+def configure_blender_blocks_remesh_modifier(context, modifier, settings, source_obj):
+    modifier.mode = 'BLOCKS'
+    modifier.octree_depth = get_blender_blocks_octree_depth_for_target_size(context, settings, source_obj)
+    modifier.scale = float(settings.scale)
+    modifier.threshold = float(settings.threshold)
+    if hasattr(modifier, "use_remove_disconnected"):
+        modifier.use_remove_disconnected = bool(settings.remove_disconnected)
+    if hasattr(modifier, "use_smooth_shade"):
+        modifier.use_smooth_shade = False
+
+
+def apply_blender_blocks_remesh(context, obj, settings, source_obj):
+    set_active_object(context, obj)
+    modifier = obj.modifiers.new("Miniature Voxeler Blocks", 'REMESH')
+    configure_blender_blocks_remesh_modifier(context, modifier, settings, source_obj)
+    applied_depth = int(modifier.octree_depth)
+    bpy.ops.object.modifier_apply(modifier=modifier.name)
+    obj.data.update()
+    return applied_depth
+
+
+def cluster_sorted_grid_values(values, tolerance):
+    if not values:
+        return []
+
+    sorted_values = sorted(float(value) for value in values)
+    clusters = []
+    cluster_sum = sorted_values[0]
+    cluster_count = 1
+    cluster_ref = sorted_values[0]
+
+    for value in sorted_values[1:]:
+        if abs(value - cluster_ref) <= tolerance:
+            cluster_sum += value
+            cluster_count += 1
+            continue
+        clusters.append(cluster_sum / cluster_count)
+        cluster_sum = value
+        cluster_count = 1
+        cluster_ref = value
+
+    clusters.append(cluster_sum / cluster_count)
+    return clusters
+
+
+def infer_voxel_size_from_block_mesh(mesh, fallback_voxel_size):
+    coords_by_axis = (
+        [vertex.co.x for vertex in mesh.vertices],
+        [vertex.co.y for vertex in mesh.vertices],
+        [vertex.co.z for vertex in mesh.vertices],
+    )
+    rough_tolerance = max(abs(float(fallback_voxel_size)) * 1e-5, 1e-7)
+    diffs = []
+
+    for coords in coords_by_axis:
+        values = cluster_sorted_grid_values(coords, rough_tolerance)
+        for index in range(len(values) - 1):
+            diff = values[index + 1] - values[index]
+            if diff > rough_tolerance:
+                diffs.append(diff)
+
+    if not diffs:
+        return max(float(fallback_voxel_size), 1e-7)
+
+    smallest = min(diffs)
+    close_diffs = [diff for diff in diffs if diff <= smallest * 1.25]
+    return sum(close_diffs) / len(close_diffs)
+
+
+def get_block_mesh_grid(mesh, fallback_voxel_size):
+    voxel_size = infer_voxel_size_from_block_mesh(mesh, fallback_voxel_size)
+    tolerance = max(voxel_size * 1e-4, 1e-7)
+    xs = cluster_sorted_grid_values([vertex.co.x for vertex in mesh.vertices], tolerance)
+    ys = cluster_sorted_grid_values([vertex.co.y for vertex in mesh.vertices], tolerance)
+    zs = cluster_sorted_grid_values([vertex.co.z for vertex in mesh.vertices], tolerance)
+    if not xs or not ys or not zs:
+        return Vector((0.0, 0.0, 0.0)), voxel_size, (0, 0, 0)
+
+    origin = Vector((xs[0], ys[0], zs[0]))
+    counts = (
+        max(0, int(round((xs[-1] - xs[0]) / voxel_size))),
+        max(0, int(round((ys[-1] - ys[0]) / voxel_size))),
+        max(0, int(round((zs[-1] - zs[0]) / voxel_size))),
+    )
+    return origin, voxel_size, counts
+
+
+def grid_plane_index(value, origin_value, voxel_size):
+    return int(round((float(value) - float(origin_value)) / float(voxel_size)))
+
+
+def block_range_from_bounds(min_value, max_value, origin_value, voxel_size, limit):
+    start = grid_plane_index(min_value, origin_value, voxel_size)
+    end = grid_plane_index(max_value, origin_value, voxel_size)
+    start = max(0, min(start, limit))
+    end = max(0, min(end, limit))
+    return start, end
+
+
+def extract_solid_voxel_cells_from_block_mesh(obj, fallback_voxel_size):
+    mesh = obj.data
+    origin, voxel_size, counts = get_block_mesh_grid(mesh, fallback_voxel_size)
+    if voxel_size <= 0.0 or counts[0] <= 0 or counts[1] <= 0 or counts[2] <= 0:
+        return origin, voxel_size, {}, {
+            "surface_cell_count": 0,
+            "top_open_empty_count": 0,
+            "exterior_empty_count": 0,
+            "cavity_fill_count": 0,
+            "vertical_fill_count": 0,
+            "xy_slice_fill_count": 0,
+        }
+
+    row_events = {}
+    for poly in mesh.polygons:
+        normal = poly.normal
+        if abs(normal.x) < 0.9 or abs(normal.x) < abs(normal.y) or abs(normal.x) < abs(normal.z):
+            continue
+
+        verts = [mesh.vertices[index].co for index in poly.vertices]
+        x_plane = grid_plane_index(sum(vertex.x for vertex in verts) / len(verts), origin.x, voxel_size)
+        y_min = min(vertex.y for vertex in verts)
+        y_max = max(vertex.y for vertex in verts)
+        z_min = min(vertex.z for vertex in verts)
+        z_max = max(vertex.z for vertex in verts)
+        j_start, j_end = block_range_from_bounds(y_min, y_max, origin.y, voxel_size, counts[1])
+        k_start, k_end = block_range_from_bounds(z_min, z_max, origin.z, voxel_size, counts[2])
+
+        for j in range(j_start, j_end):
+            for k in range(k_start, k_end):
+                row_events.setdefault((j, k), set()).add(x_plane)
+
+    cells = {}
+    unpaired_rows = 0
+    for (j, k), event_set in row_events.items():
+        events = sorted(event for event in event_set if 0 <= event <= counts[0])
+        if len(events) < 2:
+            continue
+        if len(events) % 2 != 0:
+            unpaired_rows += 1
+            events = events[:-1]
+        for index in range(0, len(events), 2):
+            start_i = max(0, min(events[index], counts[0]))
+            end_i = max(0, min(events[index + 1], counts[0]))
+            for i in range(start_i, end_i):
+                cells[(i, j, k)] = 0
+
+    stats = {
+        "surface_cell_count": len(cells),
+        "top_open_empty_count": 0,
+        "exterior_empty_count": 0,
+        "cavity_fill_count": 0,
+        "vertical_fill_count": 0,
+        "xy_slice_fill_count": 0,
+        "unpaired_block_rows": unpaired_rows,
+    }
+    return origin, voxel_size, cells, stats
+
+
+def generate_blender_block_voxel_cells_from_object(context, remesh_obj, settings, source_obj):
+    fallback_voxel_size = get_voxel_size_scene_units(context, settings, source_obj)
+    applied_depth = apply_blender_blocks_remesh(context, remesh_obj, settings, source_obj)
+    origin, voxel_size, cells, stats = extract_solid_voxel_cells_from_block_mesh(remesh_obj, fallback_voxel_size)
+    stats["applied_octree_depth"] = applied_depth
     return origin, voxel_size, cells, stats
 
 

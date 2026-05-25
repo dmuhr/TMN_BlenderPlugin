@@ -50,7 +50,7 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
     )
 
     octree_depth: IntProperty(
-        name="Octree Depth",
+        name="Fallback Octree Depth",
         default=7,
         min=1,
         max=24,
@@ -65,8 +65,8 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
 
     voxel_size_mm: FloatProperty(
         name="Voxel Size (mm)",
-        description="Explicit cube size for the custom voxelizer. Set to 0 to derive the size from Octree Depth and Scale",
-        default=0.0,
+        description="Target cube size. Blender Blocks uses the nearest octree depth, so the final size is approximate. Set to 0 to use Fallback Octree Depth",
+        default=1.7,
         min=0.0,
         soft_max=25.0,
         precision=3,
@@ -77,6 +77,12 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
         default=1.0,
         soft_min=0.0,
         soft_max=10.0,
+    )
+
+    voxel_fill_interior: BoolProperty(
+        name="Fill Interior",
+        description="Fill enclosed voxel volume after surface voxelization. Disable for Blender Blocks-like geometry that preserves openings and undercuts",
+        default=False,
     )
 
     remove_disconnected: BoolProperty(
@@ -745,4 +751,3 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
         precision=6,
         unit='LENGTH',
     )
-

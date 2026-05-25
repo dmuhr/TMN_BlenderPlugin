@@ -80,18 +80,26 @@ class MINIATUREVOXELER_OT_block_remesh(Operator):
         new_obj = duplicate_object(context, source_obj, get_blocks_name(root_name))
         set_metadata(new_obj, root_name, source_obj.name)
 
-        origin, voxel_size, cells, voxel_stats = generate_voxel_cells_from_object(context, source_obj, settings)
+        origin, voxel_size, cells, voxel_stats = generate_blender_block_voxel_cells_from_object(context, new_obj, settings, source_obj)
+        if not cells:
+            remove_object_if_exists(new_obj)
+            self.report({'ERROR'}, "Blender Blocks remesh did not produce voxel cells for this mesh.")
+            return {'CANCELLED'}
         rebuild_voxel_mesh_from_cells(new_obj, origin, voxel_size, cells)
         new_obj["mv_surface_cell_count"] = int(voxel_stats.get("surface_cell_count", 0))
+        new_obj["mv_top_open_empty_count"] = int(voxel_stats.get("top_open_empty_count", 0))
+        new_obj["mv_exterior_empty_count"] = int(voxel_stats.get("exterior_empty_count", 0))
         new_obj["mv_cavity_fill_cell_count"] = int(voxel_stats.get("cavity_fill_count", 0))
         new_obj["mv_vertical_fill_cell_count"] = int(voxel_stats.get("vertical_fill_count", 0))
         new_obj["mv_xy_slice_fill_cell_count"] = int(voxel_stats.get("xy_slice_fill_count", 0))
+        new_obj["mv_unpaired_block_rows"] = int(voxel_stats.get("unpaired_block_rows", 0))
+        new_obj["mv_applied_octree_depth"] = int(voxel_stats.get("applied_octree_depth", settings.octree_depth))
         source_obj.hide_set(True)
         if building_obj is not None:
             building_obj.hide_set(True)
         set_active_object(context, new_obj)
         voxel_size_mm = voxel_size * context.scene.unit_settings.scale_length * 1000.0
-        self.report({'INFO'}, f"Created voxel object: {new_obj.name} from {source_obj.name} | {len(cells)} cubes | surface {voxel_stats.get('surface_cell_count', 0)} + cavity {voxel_stats.get('cavity_fill_count', 0)} + vertical {voxel_stats.get('vertical_fill_count', 0)} + XY solid {voxel_stats.get('xy_slice_fill_count', 0)} | {voxel_size_mm:.3f} mm")
+        self.report({'INFO'}, f"Created voxel object: {new_obj.name} from {source_obj.name} | {len(cells)} cubes | Blender Blocks depth {voxel_stats.get('applied_octree_depth', settings.octree_depth)} | unpaired rows {voxel_stats.get('unpaired_block_rows', 0)} | {voxel_size_mm:.3f} mm")
         return {'FINISHED'}
 
 
@@ -2215,5 +2223,3 @@ class MINIATUREVOXELER_OT_export_final_pieces(Operator):
 
         self.report({'INFO'}, f"Exported {len(exported_paths)} STL file(s) at scale 1000. {blend_copy_text}")
         return {'FINISHED'}
-
-
