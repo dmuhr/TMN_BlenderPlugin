@@ -46,7 +46,9 @@ class MINIATUREVOXELER_PT_panel(Panel):
         settings = context.scene.miniature_voxeler_settings
         building_obj = get_building_object(settings)
         platform_obj = get_platform_object(settings)
-        blocks_obj = get_blocks_object(settings)
+        blocks_obj = get_temporary_blocks_object(settings)
+        model_obj = get_model_object(settings)
+        ruin_obj = get_ruin_object(settings)
         walls_obj = get_platform_walls_object(settings)
         foot_obj = get_platform_foot_object(settings)
 
@@ -192,19 +194,36 @@ class MINIATUREVOXELER_PT_panel(Panel):
             box.label(text="Adds one cube under each lowest XY column per click.")
             box.operator("object.mv_voxel_connect_to_foot", text="Add One Lower Cube Layer", icon='SNAP_ON')
 
-            # Step 2.4 bakes the building texture and turns it into fixed Lego color slots.
-            box = self.draw_step_box(layout, 'BUILDING', "2.4 Texture And Color")
+            # Step 2.4 splits the temporary voxel object into durable model and ruin targets.
+            box = self.draw_step_box(layout, 'BUILDING', "2.4 Split Model And Ruin")
+            if blocks_obj is None:
+                box.label(text="Run 2.1 first so the _Blocks object exists.")
+            else:
+                box.label(text=f"Split {blocks_obj.name} into _M and _R, then delete _Blocks.")
+            box.operator("object.miniature_voxeler_split_model_ruin", text="Create _M and _R", icon='DUPLICATE')
+
+        if self.draw_path_divider(layout, settings, 'MODEL', "show_model_steps"):
+            # Step 3.1 bakes the model texture and turns it into fixed Lego color slots.
+            box = self.draw_step_box(layout, 'MODEL', "3.1 Texture And Color")
+            if model_obj is not None:
+                box.label(text=f"Model target: {model_obj.name}")
             box.operator("object.miniature_voxeler_smart_uv_project", text="Generate UVs", icon='UV')
-            texture_col = box.column(align=True)
-            texture_col.prop(settings, "texture_source_name")
-            texture_col.prop(settings, "texture_source_filepath")
-            texture_col.prop(settings, "texture_size")
-            texture_col.prop(settings, "texture_margin")
-            texture_col.prop(settings, "texture_bake_type")
-            texture_col.prop(settings, "texture_projection_distance")
-            texture_col.prop(settings, "texture_cage_extrusion")
-            texture_col.prop(settings, "texture_bake_samples")
-            texture_col.prop(settings, "texture_clear_image")
+            box.prop(
+                settings,
+                "show_model_texture_settings",
+                icon='TRIA_DOWN' if settings.show_model_texture_settings else 'TRIA_RIGHT',
+            )
+            if settings.show_model_texture_settings:
+                texture_col = box.column(align=True)
+                texture_col.prop(settings, "texture_source_name")
+                texture_col.prop(settings, "texture_source_filepath")
+                texture_col.prop(settings, "texture_size")
+                texture_col.prop(settings, "texture_margin")
+                texture_col.prop(settings, "texture_bake_type")
+                texture_col.prop(settings, "texture_projection_distance")
+                texture_col.prop(settings, "texture_cage_extrusion")
+                texture_col.prop(settings, "texture_bake_samples")
+                texture_col.prop(settings, "texture_clear_image")
             box.operator("object.miniature_voxeler_transfer_texture", text="Transfer Texture", icon='TEXTURE')
             box.operator("object.miniature_voxeler_direct_source_colors", text="Direct Source Colors", icon='MATERIAL')
             color_col = box.column(align=True)
@@ -217,22 +236,28 @@ class MINIATUREVOXELER_PT_panel(Panel):
             delete_row.alert = True
             delete_row.operator("object.miniature_voxeler_delete_lego_color_slots", text="Delete Color Slots", icon='TRASH')
 
-            # Step 2.5 smooths material assignments before manual brush edits.
-            box = self.draw_step_box(layout, 'BUILDING', "2.5 Smooth Colors")
-            smooth_col = box.column(align=True)
-            smooth_col.prop(settings, "lego_smooth_mode")
-            smooth_col.prop(settings, "lego_smooth_passes")
-            smooth_col.prop(settings, "lego_smooth_min_neighbors")
-            smooth_col.prop(settings, "lego_smooth_weight")
-            if settings.lego_smooth_mode == 'ISLANDS':
-                smooth_col.prop(settings, "lego_smooth_max_island_faces")
-            smooth_col.prop(settings, "lego_smooth_include_corners")
-            smooth_col.prop(settings, "lego_smooth_protect_slot")
+            # Step 3.2 smooths material assignments before manual brush edits.
+            box = self.draw_step_box(layout, 'MODEL', "3.2 Smooth Colors")
+            box.prop(
+                settings,
+                "show_model_smooth_settings",
+                icon='TRIA_DOWN' if settings.show_model_smooth_settings else 'TRIA_RIGHT',
+            )
+            if settings.show_model_smooth_settings:
+                smooth_col = box.column(align=True)
+                smooth_col.prop(settings, "lego_smooth_mode")
+                smooth_col.prop(settings, "lego_smooth_passes")
+                smooth_col.prop(settings, "lego_smooth_min_neighbors")
+                smooth_col.prop(settings, "lego_smooth_weight")
+                if settings.lego_smooth_mode == 'ISLANDS':
+                    smooth_col.prop(settings, "lego_smooth_max_island_faces")
+                smooth_col.prop(settings, "lego_smooth_include_corners")
+                smooth_col.prop(settings, "lego_smooth_protect_slot")
             box.operator("object.miniature_voxeler_smooth_lego_color", icon='MOD_SMOOTH')
 
-            # Step 2.6 keeps face painting and cube editing in one always-available brush.
-            box = self.draw_step_box(layout, 'BUILDING', "2.6 Voxel Brush Editing")
-            debug_active = blocks_obj is not None and bool(blocks_obj.get("mv_debug_colors_active", False))
+            # Step 3.3 keeps face painting and cube editing in one always-available brush.
+            box = self.draw_step_box(layout, 'MODEL', "3.3 Voxel Brush Editing")
+            debug_active = model_obj is not None and bool(model_obj.get("mv_debug_colors_active", False))
             box.operator(
                 "object.miniature_voxeler_toggle_debug_colors",
                 text="Debug Colors",
@@ -339,10 +364,10 @@ class MINIATUREVOXELER_PT_panel(Panel):
             except Exception as error:
                 error_row = box.row(align=True)
                 error_row.alert = True
-                error_row.label(text=f"2.6 UI error: {error}", icon='ERROR')
+                error_row.label(text=f"3.3 UI error: {error}", icon='ERROR')
 
-            # Step 2.7 exports the colored building shell pieces for downstream use.
-            box = self.draw_step_box(layout, 'BUILDING', "2.7 Prepare Skin")
+            # Step 3.4 prepares model skin pieces for export.
+            box = self.draw_step_box(layout, 'MODEL', "3.4 Prepare Skin")
             col = box.column(align=True)
             col.prop(settings, "color_skin_base_slot")
             col.prop(settings, "skin_subdivision_steps")
@@ -362,8 +387,156 @@ class MINIATUREVOXELER_PT_panel(Panel):
 
             box.operator("object.miniature_voxeler_separate_skins_solidify", text="Separate Skins and Solidify", icon='MATERIAL')
 
+        if self.draw_path_divider(layout, settings, 'RUIN', "show_ruin_steps"):
+            box = self.draw_step_box(layout, 'RUIN', "4.1 Texture And Color")
+            if ruin_obj is None:
+                box.label(text="Run 2.4 Split Model And Ruin first so _R exists.")
+            else:
+                box.label(text=f"Ruin target: {ruin_obj.name}")
+            box.operator("object.miniature_voxeler_run_ruin_workflow_op", text="Generate UVs", icon='UV').operation = 'UV'
+            box.prop(
+                settings,
+                "show_ruin_texture_settings",
+                icon='TRIA_DOWN' if settings.show_ruin_texture_settings else 'TRIA_RIGHT',
+            )
+            if settings.show_ruin_texture_settings:
+                texture_col = box.column(align=True)
+                texture_col.prop(settings, "texture_source_name")
+                texture_col.prop(settings, "texture_source_filepath")
+                texture_col.prop(settings, "texture_size")
+                texture_col.prop(settings, "texture_margin")
+                texture_col.prop(settings, "texture_bake_type")
+                texture_col.prop(settings, "texture_projection_distance")
+                texture_col.prop(settings, "texture_cage_extrusion")
+                texture_col.prop(settings, "texture_bake_samples")
+                texture_col.prop(settings, "texture_clear_image")
+            box.operator("object.miniature_voxeler_run_ruin_workflow_op", text="Transfer Texture", icon='TEXTURE').operation = 'TRANSFER_TEXTURE'
+            box.operator("object.miniature_voxeler_run_ruin_workflow_op", text="Direct Source Colors", icon='MATERIAL').operation = 'DIRECT_COLORS'
+            color_col = box.column(align=True)
+            color_col.prop(settings, "lego_color_count")
+            color_col.prop(settings, "lego_color_sample_mode")
+            color_col.prop(settings, "lego_color_assign_mode")
+            color_row = box.row(align=True)
+            color_row.operator("object.miniature_voxeler_run_ruin_workflow_op", text="Create Color Slots", icon='MATERIAL').operation = 'LEGO_COLOR'
+            delete_op = color_row.operator("object.miniature_voxeler_run_ruin_workflow_op", text="Delete Color Slots", icon='TRASH')
+            delete_op.operation = 'DELETE_COLORS'
+
+            box = self.draw_step_box(layout, 'RUIN', "4.2 Smooth Colors")
+            box.prop(
+                settings,
+                "show_ruin_smooth_settings",
+                icon='TRIA_DOWN' if settings.show_ruin_smooth_settings else 'TRIA_RIGHT',
+            )
+            if settings.show_ruin_smooth_settings:
+                smooth_col = box.column(align=True)
+                smooth_col.prop(settings, "lego_smooth_mode")
+                smooth_col.prop(settings, "lego_smooth_passes")
+                smooth_col.prop(settings, "lego_smooth_min_neighbors")
+                smooth_col.prop(settings, "lego_smooth_weight")
+                if settings.lego_smooth_mode == 'ISLANDS':
+                    smooth_col.prop(settings, "lego_smooth_max_island_faces")
+                smooth_col.prop(settings, "lego_smooth_include_corners")
+                smooth_col.prop(settings, "lego_smooth_protect_slot")
+            box.operator("object.miniature_voxeler_run_ruin_workflow_op", text="Smooth Lego Color", icon='MOD_SMOOTH').operation = 'SMOOTH_COLORS'
+
+            box = self.draw_step_box(layout, 'RUIN', "4.3 Voxel Brush Editing")
+            ruin_debug_active = ruin_obj is not None and bool(ruin_obj.get("mv_debug_colors_active", False))
+            box.operator(
+                "object.miniature_voxeler_run_ruin_workflow_op",
+                text="Debug Colors",
+                icon='MATERIAL',
+                depress=ruin_debug_active,
+            ).operation = 'DEBUG_COLORS'
+            color_count = max(1, min(4, int(getattr(settings, "lego_color_count", 1))))
+            active_slot = max(0, min(int(getattr(settings, "selected_lego_palette_slot", 0)), color_count - 1))
+            active_brush = MINIATUREVOXELER_OT_voxel_brush_tool._active_tool
+            is_brush_active = (
+                active_brush is not None and
+                not getattr(active_brush, "_cancel_requested", False) and
+                active_brush.mode == 'PAINT'
+            )
+            is_rectangle_active = (
+                active_brush is not None and
+                not getattr(active_brush, "_cancel_requested", False) and
+                active_brush.mode == 'BOX_PAINT'
+            )
+            is_lasso_active = (
+                active_brush is not None and
+                not getattr(active_brush, "_cancel_requested", False) and
+                active_brush.mode == 'LASSO_PAINT'
+            )
+            tool_row = box.row(align=True)
+            brush_op = tool_row.operator("object.miniature_voxeler_run_ruin_workflow_op", text="Brush", icon='BRUSH_DATA', depress=is_brush_active)
+            brush_op.operation = 'BRUSH'
+            brush_op.slot_index = active_slot
+            rectangle_op = tool_row.operator("object.miniature_voxeler_run_ruin_workflow_op", text="Rectangle", icon='SELECT_SET', depress=is_rectangle_active)
+            rectangle_op.operation = 'BOX_PAINT'
+            rectangle_op.slot_index = active_slot
+            lasso_op = tool_row.operator("object.miniature_voxeler_run_ruin_workflow_op", text="Lasso", icon='SELECT_INTERSECT', depress=is_lasso_active)
+            lasso_op.operation = 'LASSO_PAINT'
+            lasso_op.slot_index = active_slot
+            try:
+                current_paint_tool_mode = getattr(settings, "lego_paint_tool_mode", 'PAINT')
+                if current_paint_tool_mode == 'PAINT':
+                    box.prop(settings, "lego_paint_brush_size")
+
+                selected_col = box.column(align=True)
+                for slot_index in range(color_count):
+                    fixed_index = int(getattr(settings, f"lego_palette_slot_{slot_index + 1}", 0))
+                    fixed_index = max(0, min(fixed_index, len(FIXED_LEGO_PALETTE) - 1))
+                    row = selected_col.row(align=True)
+                    swatch = row.row(align=True)
+                    swatch.enabled = False
+                    if ruin_debug_active:
+                        swatch.prop(settings, f"debug_palette_slot_color_{slot_index + 1}", text="")
+                        debug_names = ("Red", "Green", "Blue", "White")
+                        row.label(text=f"Slot {slot_index + 1}: Debug {debug_names[slot_index]}")
+                    else:
+                        swatch.prop(settings, f"lego_palette_slot_color_{slot_index + 1}", text="")
+                        row.label(text=f"Slot {slot_index + 1}: {FIXED_LEGO_PALETTE[fixed_index][0]}")
+                    is_selected_slot = active_slot == slot_index
+                    op = row.operator(
+                        "object.miniature_voxeler_run_ruin_workflow_op",
+                        text="",
+                        icon='RADIOBUT_ON' if is_selected_slot else 'RADIOBUT_OFF',
+                        depress=is_selected_slot,
+                    )
+                    op.operation = 'SELECT_SLOT'
+                    op.slot_index = slot_index
+
+                box.prop(settings, "platform_foot_color_slot")
+
+                box.label(text=f"Palette For Slot {active_slot + 1}")
+                palette_grid = box.grid_flow(row_major=True, columns=4, even_columns=True, even_rows=False, align=True)
+                current_index = int(getattr(settings, f"lego_palette_slot_{active_slot + 1}", 0))
+                current_index = max(0, min(current_index, len(FIXED_LEGO_PALETTE) - 1))
+                for palette_index, (_palette_name, _palette_color) in enumerate(FIXED_LEGO_PALETTE):
+                    cell = palette_grid.column(align=True)
+                    swatch_row = cell.row(align=True)
+                    swatch_row.enabled = False
+                    swatch_row.prop(settings, f"fixed_palette_color_{palette_index + 1}", text="")
+                    op = cell.operator(
+                        "object.miniature_voxeler_run_ruin_workflow_op",
+                        text="",
+                        icon='RADIOBUT_ON' if current_index == palette_index else 'RADIOBUT_OFF',
+                        depress=current_index == palette_index,
+                    )
+                    op.operation = 'SET_PALETTE'
+                    op.slot_index = active_slot
+                    op.palette_index = palette_index
+
+                voxel_row = box.row(align=True)
+                is_modify_active = active_brush is not None and not getattr(active_brush, "_cancel_requested", False) and active_brush.mode == 'ADD'
+                modify_op = voxel_row.operator("object.miniature_voxeler_run_ruin_workflow_op", text="Modify Cubes", icon='MOD_BUILD', depress=is_modify_active)
+                modify_op.operation = 'MODIFY_CUBES'
+                modify_op.slot_index = active_slot
+            except Exception as error:
+                error_row = box.row(align=True)
+                error_row.alert = True
+                error_row.label(text=f"4.3 UI error: {error}", icon='ERROR')
+
         if self.draw_path_divider(layout, settings, 'EXPORT', "show_export_steps"):
-            box = self.draw_step_box(layout, 'EXPORT', "3. Export")
+            box = self.draw_step_box(layout, 'EXPORT', "5.1 Export Model STL + Blend")
             col = box.column(align=True)
             col.prop(settings, "export_directory")
             export_pieces = get_export_piece_objects(settings)
@@ -374,5 +547,12 @@ class MINIATUREVOXELER_PT_panel(Panel):
             else:
                 box.label(text="Prepare _foot, _Base, and skins before exporting.")
             box.operator("object.miniature_voxeler_export_final_pieces", text="Export Batch STL + Blend Copy", icon='EXPORT')
+
+            box = self.draw_step_box(layout, 'EXPORT', "5.2 Export Ruin FBX")
+            if ruin_obj is None:
+                box.label(text="Run 2.4 Split Model And Ruin first so _R exists.")
+            else:
+                box.label(text=f"FBX target: {ruin_obj.name}")
+            box.operator("object.miniature_voxeler_export_ruin_fbx", text="Export _R FBX", icon='EXPORT')
 
 # ------------------------------------------------------------

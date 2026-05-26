@@ -42,6 +42,49 @@ class MINIATUREVOXELER_PG_settings(PropertyGroup):
         default=True,
     )
 
+    show_model_steps: BoolProperty(
+        name="---- MODEL ----",
+        description="Show or hide the model workflow steps",
+        default=True,
+    )
+
+    show_ruin_steps: BoolProperty(
+        name="---- RUIN ----",
+        description="Show or hide the ruin workflow steps",
+        default=True,
+    )
+
+    workflow_target_object_name: StringProperty(
+        name="Workflow Target",
+        description="Internal temporary target override for model/ruin workflow operators",
+        default="",
+        options={'HIDDEN'},
+    )
+
+    show_model_texture_settings: BoolProperty(
+        name="Texture Settings",
+        description="Show model texture bake settings",
+        default=False,
+    )
+
+    show_model_smooth_settings: BoolProperty(
+        name="Smooth Settings",
+        description="Show model color smoothing settings",
+        default=False,
+    )
+
+    show_ruin_texture_settings: BoolProperty(
+        name="Texture Settings",
+        description="Show ruin texture bake settings",
+        default=False,
+    )
+
+    show_ruin_smooth_settings: BoolProperty(
+        name="Smooth Settings",
+        description="Show ruin color smoothing settings",
+        default=False,
+    )
+
     export_directory: StringProperty(
         name="Export Folder",
         description="Folder for batch STL export and the optional Blender file copy",

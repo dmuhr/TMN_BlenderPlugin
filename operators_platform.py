@@ -1007,11 +1007,11 @@ class MINIATUREVOXELER_OT_remove_voxel_xy_wall_layers(Operator):
     @classmethod
     def poll(cls, context):
         settings = getattr(context.scene, "miniature_voxeler_settings", None)
-        return settings is not None and get_blocks_object(settings) is not None
+        return settings is not None and get_temporary_blocks_object(settings) is not None
 
     def execute(self, context):
         settings = context.scene.miniature_voxeler_settings
-        blocks_obj = get_blocks_object(settings)
+        blocks_obj = get_temporary_blocks_object(settings)
         if blocks_obj is None:
             self.report({'ERROR'}, "Run Voxel Building first so the _Blocks object exists.")
             return {'CANCELLED'}
@@ -1037,11 +1037,11 @@ class MINIATUREVOXELER_OT_connect_voxels_to_foot(Operator):
     @classmethod
     def poll(cls, context):
         settings = getattr(context.scene, "miniature_voxeler_settings", None)
-        return settings is not None and get_blocks_object(settings) is not None
+        return settings is not None and get_temporary_blocks_object(settings) is not None
 
     def execute(self, context):
         settings = context.scene.miniature_voxeler_settings
-        blocks_obj = get_blocks_object(settings)
+        blocks_obj = get_temporary_blocks_object(settings)
         if blocks_obj is None:
             self.report({'ERROR'}, "Run Voxel Building first so the _Blocks object exists.")
             return {'CANCELLED'}
@@ -1057,5 +1057,4 @@ class MINIATUREVOXELER_OT_connect_voxels_to_foot(Operator):
         set_active_object(context, blocks_obj)
         self.report({'INFO'}, f"Added {added_count} voxel cells under the lowest layer of {blocks_obj.name}.")
         return {'FINISHED'}
-
 

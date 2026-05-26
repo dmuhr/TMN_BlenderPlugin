@@ -127,6 +127,9 @@ class MINIATUREVOXELER_OT_smart_uv_project(Operator):
             bpy.ops.object.mode_set(mode='OBJECT')
 
         set_active_object(context, obj)
+        if context.view_layer.objects.active != obj:
+            self.report({'ERROR'}, f"Could not make {obj.name} active for UV generation.")
+            return {'CANCELLED'}
 
         bpy.ops.object.mode_set(mode='EDIT')
         bpy.ops.mesh.select_all(action='SELECT')
@@ -134,6 +137,51 @@ class MINIATUREVOXELER_OT_smart_uv_project(Operator):
         bpy.ops.object.mode_set(mode='OBJECT')
 
         self.report({'INFO'}, f"Smart UV Project completed for {obj.name}")
+        return {'FINISHED'}
+
+
+class MINIATUREVOXELER_OT_split_model_ruin(Operator):
+    bl_idname = "object.miniature_voxeler_split_model_ruin"
+    bl_label = "Split Model And Ruin"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        settings = getattr(context.scene, "miniature_voxeler_settings", None)
+        return settings is not None and get_temporary_blocks_object(settings) is not None
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        blocks_obj = get_temporary_blocks_object(settings)
+        if blocks_obj is None:
+            self.report({'ERROR'}, "Run Voxel Building first so the _Blocks object exists.")
+            return {'CANCELLED'}
+
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        root_name = get_root_name(blocks_obj.name)
+        existing_model = bpy.data.objects.get(get_model_name(root_name))
+        existing_ruin = bpy.data.objects.get(get_ruin_name(root_name))
+        if existing_model is not None:
+            remove_object_if_exists(existing_model)
+        if existing_ruin is not None:
+            remove_object_if_exists(existing_ruin)
+
+        model_obj = duplicate_object(context, blocks_obj, get_model_name(root_name))
+        ruin_obj = duplicate_object(context, blocks_obj, get_ruin_name(root_name))
+        set_metadata(model_obj, root_name, str(blocks_obj.get("mv_source_object", blocks_obj.name)))
+        set_metadata(ruin_obj, root_name, str(blocks_obj.get("mv_source_object", blocks_obj.name)))
+        model_obj["mv_workflow_variant"] = "MODEL"
+        ruin_obj["mv_workflow_variant"] = "RUIN"
+
+        remove_object_if_exists(blocks_obj)
+        settings.workflow_target_object_name = ""
+        model_obj.hide_set(False)
+        ruin_obj.hide_set(False)
+        set_active_object(context, model_obj)
+
+        self.report({'INFO'}, f"Created {model_obj.name} and {ruin_obj.name}; deleted _Blocks.")
         return {'FINISHED'}
 
 
@@ -2142,6 +2190,88 @@ class MINIATUREVOXELER_OT_apply_skin_booleans(Operator):
         return {'FINISHED'}
 
 
+class MINIATUREVOXELER_OT_run_ruin_workflow_op(Operator):
+    bl_idname = "object.miniature_voxeler_run_ruin_workflow_op"
+    bl_label = "Run Ruin Tool"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    operation: EnumProperty(
+        items=(
+            ('UV', "Generate UVs", ""),
+            ('TRANSFER_TEXTURE', "Transfer Texture", ""),
+            ('DIRECT_COLORS', "Direct Source Colors", ""),
+            ('LEGO_COLOR', "Create Color Slots", ""),
+            ('DELETE_COLORS', "Delete Color Slots", ""),
+            ('SMOOTH_COLORS', "Smooth Colors", ""),
+            ('DEBUG_COLORS', "Debug Colors", ""),
+            ('BRUSH', "Brush", ""),
+            ('BOX_PAINT', "Rectangle", ""),
+            ('LASSO_PAINT', "Lasso", ""),
+            ('MODIFY_CUBES', "Modify Cubes", ""),
+            ('SELECT_SLOT', "Select Paint Slot", ""),
+            ('SET_PALETTE', "Set Palette Color", ""),
+        ),
+        default='UV',
+    )
+    slot_index: IntProperty(default=0, min=0, max=3)
+    palette_index: IntProperty(default=0, min=0, max=len(FIXED_LEGO_PALETTE) - 1)
+
+    @classmethod
+    def poll(cls, context):
+        return getattr(context.scene, "miniature_voxeler_settings", None) is not None
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        ruin_obj = get_ruin_object(settings)
+        if ruin_obj is None:
+            self.report({'ERROR'}, "Run Step 2.4 Split Model And Ruin first so the _R object exists.")
+            return {'CANCELLED'}
+
+        previous_target = settings.workflow_target_object_name
+        settings.workflow_target_object_name = ruin_obj.name
+        try:
+            set_active_object(context, ruin_obj)
+            if self.operation == 'UV':
+                return bpy.ops.object.miniature_voxeler_smart_uv_project()
+            if self.operation == 'TRANSFER_TEXTURE':
+                return bpy.ops.object.miniature_voxeler_transfer_texture()
+            if self.operation == 'DIRECT_COLORS':
+                return bpy.ops.object.miniature_voxeler_direct_source_colors()
+            if self.operation == 'LEGO_COLOR':
+                return bpy.ops.object.miniature_voxeler_lego_color()
+            if self.operation == 'DELETE_COLORS':
+                return bpy.ops.object.miniature_voxeler_delete_lego_color_slots()
+            if self.operation == 'SMOOTH_COLORS':
+                return bpy.ops.object.miniature_voxeler_smooth_lego_color()
+            if self.operation == 'DEBUG_COLORS':
+                return bpy.ops.object.miniature_voxeler_toggle_debug_colors()
+            if self.operation == 'SELECT_SLOT':
+                return bpy.ops.object.miniature_voxeler_select_paint_slot(
+                    slot_index=max(0, min(int(self.slot_index), 3)),
+                )
+            if self.operation == 'SET_PALETTE':
+                return bpy.ops.object.miniature_voxeler_set_palette_color(
+                    slot_index=max(0, min(int(self.slot_index), 3)),
+                    palette_index=max(0, min(int(self.palette_index), len(FIXED_LEGO_PALETTE) - 1)),
+                )
+            if self.operation in {'BRUSH', 'BOX_PAINT', 'LASSO_PAINT', 'MODIFY_CUBES'}:
+                mode_by_operation = {
+                    'BRUSH': 'PAINT',
+                    'BOX_PAINT': 'BOX_PAINT',
+                    'LASSO_PAINT': 'LASSO_PAINT',
+                    'MODIFY_CUBES': 'ADD',
+                }
+                return bpy.ops.object.miniature_voxeler_voxel_brush_tool(
+                    mode=mode_by_operation[self.operation],
+                    slot_index=max(0, min(int(self.slot_index), 3)),
+                )
+        finally:
+            settings.workflow_target_object_name = previous_target
+
+        self.report({'ERROR'}, "Unknown ruin operation.")
+        return {'CANCELLED'}
+
+
 class MINIATUREVOXELER_OT_export_final_pieces(Operator):
     bl_idname = "object.miniature_voxeler_export_final_pieces"
     bl_label = "Export Final Pieces"
@@ -2222,4 +2352,49 @@ class MINIATUREVOXELER_OT_export_final_pieces(Operator):
                 context.view_layer.objects.active = active_before
 
         self.report({'INFO'}, f"Exported {len(exported_paths)} STL file(s) at scale 1000. {blend_copy_text}")
+        return {'FINISHED'}
+
+
+class MINIATUREVOXELER_OT_export_ruin_fbx(Operator):
+    bl_idname = "object.miniature_voxeler_export_ruin_fbx"
+    bl_label = "Export Ruin FBX"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return getattr(context.scene, "miniature_voxeler_settings", None) is not None
+
+    def execute(self, context):
+        settings = context.scene.miniature_voxeler_settings
+        ruin_obj = get_ruin_object(settings)
+        if ruin_obj is None:
+            self.report({'ERROR'}, "Run Step 2.4 Split Model And Ruin first so the _R object exists.")
+            return {'CANCELLED'}
+
+        selected_before = [obj for obj in context.selected_objects]
+        active_before = context.view_layer.objects.active
+        visibility_before = (ruin_obj, ruin_obj.hide_get(), ruin_obj.hide_viewport)
+
+        try:
+            export_dir = resolve_export_directory(settings)
+            filepath = os.path.join(export_dir, f"{sanitize_export_filename(ruin_obj.name)}.fbx")
+            export_object_to_fbx(context, ruin_obj, filepath)
+        except Exception as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+        finally:
+            if context.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+            bpy.ops.object.select_all(action='DESELECT')
+            obj, hide_select_state, hide_viewport_state = visibility_before
+            if obj.name in bpy.data.objects:
+                obj.hide_set(hide_select_state)
+                obj.hide_viewport = hide_viewport_state
+            for obj in selected_before:
+                if obj.name in bpy.data.objects:
+                    obj.select_set(True)
+            if active_before is not None and active_before.name in bpy.data.objects:
+                context.view_layer.objects.active = active_before
+
+        self.report({'INFO'}, f"Exported ruin FBX: {filepath}")
         return {'FINISHED'}

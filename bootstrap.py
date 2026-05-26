@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Miniature Voxeler",
     "author": "Diego Muhr",
-    "version": (6, 0, 0),
+    "version": (6, 1, 3),
     "blender": (5, 0, 1),
     "location": "3D View > Sidebar > Miniature Voxeler",
     "description": "Block remesh, transfer texture, create Lego-color face materials, and generate Lego skin meshes for miniature voxel workflows",
@@ -32,7 +32,7 @@ from bpy.props import (
     EnumProperty,
 )
 
-ADDON_VERSION_TEXT = "v.6.0.0"
+ADDON_VERSION_TEXT = "v.6.1.3"
 VOXEL_MESH_FORMAT_VERSION = 405
 VOXEL_MESH_FORMAT_VERSION_KEY = "mv_voxel_mesh_format_version"
 
@@ -97,6 +97,16 @@ WORKFLOW_ROLE_STYLES = {
         "label": "Building",
         "icon": 'MOD_BUILD',
         "divider": "---- BUILDING ----",
+    },
+    'MODEL': {
+        "label": "Model",
+        "icon": 'MESH_CUBE',
+        "divider": "---- MODEL ----",
+    },
+    'RUIN': {
+        "label": "Ruin",
+        "icon": 'MOD_DECIM',
+        "divider": "---- RUIN ----",
     },
     'PLATFORM': {
         "label": "Platform",
@@ -310,7 +320,7 @@ def has_source_objects(context):
     return get_building_object(settings) is not None and get_platform_object(settings) is not None
 
 
-def get_blocks_object(settings):
+def get_temporary_blocks_object(settings):
     building_obj = get_building_object(settings)
     if building_obj is not None:
         blocks_name = get_blocks_name(get_root_name(building_obj.name))
@@ -328,11 +338,67 @@ def get_blocks_object(settings):
     return None
 
 
+def get_named_workflow_object(name):
+    if not name:
+        return None
+    obj = bpy.data.objects.get(name)
+    if obj is None or obj.type != 'MESH':
+        return None
+    return obj
+
+
+def get_model_object(settings):
+    building_obj = get_building_object(settings)
+    if building_obj is not None:
+        obj = bpy.data.objects.get(get_model_name(get_root_name(building_obj.name)))
+        if obj is not None and obj.type == 'MESH':
+            return obj
+    return get_temporary_blocks_object(settings)
+
+
+def get_ruin_object(settings):
+    building_obj = get_building_object(settings)
+    if building_obj is not None:
+        obj = bpy.data.objects.get(get_ruin_name(get_root_name(building_obj.name)))
+        if obj is not None and obj.type == 'MESH':
+            return obj
+
+    candidates = [
+        obj
+        for obj in bpy.data.objects
+        if obj.type == 'MESH' and obj.name.endswith("_R") and obj.get("mv_voxel_cells_json", "")
+    ]
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def get_blocks_object(settings):
+    override_obj = get_named_workflow_object(getattr(settings, "workflow_target_object_name", ""))
+    if override_obj is not None:
+        return override_obj
+    return get_model_object(settings)
+
+
 def has_blocks_object(context):
     settings = getattr(context.scene, "miniature_voxeler_settings", None)
     if settings is None:
         return False
     return get_blocks_object(settings) is not None
+
+
+def has_temporary_blocks_object(context):
+    settings = getattr(context.scene, "miniature_voxeler_settings", None)
+    if settings is None:
+        return False
+    return get_temporary_blocks_object(settings) is not None
+
+
+def has_ruin_object(context):
+    settings = getattr(context.scene, "miniature_voxeler_settings", None)
+    if settings is None:
+        return False
+    return get_ruin_object(settings) is not None
 
 
 def get_texture_source_object(settings):

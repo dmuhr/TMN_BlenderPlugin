@@ -16,6 +16,8 @@ def set_active_object(context, obj):
     if context.mode != 'OBJECT':
         bpy.ops.object.mode_set(mode='OBJECT')
     bpy.ops.object.select_all(action='DESELECT')
+    obj.hide_set(False)
+    obj.hide_viewport = False
     obj.select_set(True)
     context.view_layer.objects.active = obj
 
@@ -67,11 +69,23 @@ def get_root_name(obj_name):
         return obj_name[:-12]
     if obj_name.endswith("_Blocks"):
         return obj_name[:-7]
+    if obj_name.endswith("_M"):
+        return obj_name[:-2]
+    if obj_name.endswith("_R"):
+        return obj_name[:-2]
     return obj_name
 
 
 def get_blocks_name(root_name):
     return f"{root_name}_Blocks"
+
+
+def get_model_name(root_name):
+    return f"{root_name}_M"
+
+
+def get_ruin_name(root_name):
+    return f"{root_name}_R"
 
 
 def get_building_copy_name(root_name):
@@ -442,6 +456,47 @@ def export_object_to_stl(context, obj, filepath, scale=1000.0):
             ) from legacy_error
 
 
+def export_object_to_fbx(context, obj, filepath):
+    if context.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+    if os.path.isfile(filepath):
+        os.remove(filepath)
+
+    bpy.ops.object.select_all(action='DESELECT')
+    obj.hide_set(False)
+    obj.hide_viewport = False
+    obj.select_set(True)
+    context.view_layer.objects.active = obj
+
+    bpy.ops.export_scene.fbx(
+        filepath=filepath,
+        use_selection=True,
+        object_types={'MESH'},
+        use_custom_props=False,
+        global_scale=1.0,
+        apply_unit_scale=True,
+        apply_scale_options='FBX_SCALE_ALL',
+        axis_forward='-Z',
+        axis_up='Y',
+        use_space_transform=True,
+        bake_space_transform=True,
+        mesh_smooth_type='FACE',
+        use_subsurf=False,
+        use_mesh_modifiers=True,
+        use_mesh_edges=False,
+        use_triangles=True,
+        use_tspace=True,
+        colors_type='SRGB',
+        primary_bone_axis='Y',
+        secondary_bone_axis='X',
+        armature_nodetype='NULL',
+        use_armature_deform_only=False,
+        add_leaf_bones=False,
+        bake_anim=False,
+    )
+
+
 def ensure_boolean_modifier(target_obj, cutter_obj, modifier_name, operation='DIFFERENCE', solver='EXACT'):
     mod = target_obj.modifiers.get(modifier_name)
     if mod is None or mod.type != 'BOOLEAN':
@@ -502,5 +557,3 @@ def ensure_solidify_modifier(obj, modifier_name, thickness, offset, use_even_thi
     if hasattr(mod, "use_rim"):
         mod.use_rim = True
     return mod
-
-
